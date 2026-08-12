@@ -578,7 +578,28 @@ func (s *Server) readUpstreamLoop(sess *clientSession, upstream *net.UDPConn) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			return
+			// A transient socket error — e.g. ECONNREFUSED from an ICMP "port
+			// unreachable" delivered while the L4D2 server was down or restarting —
+			// must NOT kill this loop. If it did, the session would silently lose the
+			// server→client direction forever: the client's packets still get
+			// forwarded to the L4D2 server (so its receive side looks continuous) but
+			// the L4D2 server's replies pile up in this socket's receive buffer and
+			// are never relayed back. The client's netchan then degrades (choked
+			// usercmds / lost inputs), times out, and reconnects straight into an
+			// "Invalid challenge packet" because the reader is gone. Once the L4D2
+			// server is back, this same socket works again — we only have to keep
+			// reading on it. Only a real shutdown/close stops the loop.
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+			}
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+			log.Printf("[Server] Upstream read error (sid=%d): %v — continuing on same socket", sess.sessionID, err)
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
 		sess.mu.RLock()
