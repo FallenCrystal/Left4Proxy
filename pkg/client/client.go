@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -15,6 +16,12 @@ import (
 	"left4proxy/pkg/router"
 	"left4proxy/pkg/stun"
 )
+
+// gameConnIdleTimeout is how long the game netchannel socket can be silent
+// before the client logs it as closed (the game returned to the main menu or
+// its connection dropped). The game keeps sending heartbeats/timesync while
+// connected, so 30s is well beyond normal idle.
+const gameConnIdleTimeout = 30 * time.Second
 
 type serverCandidate struct {
 	mu            sync.RWMutex
@@ -60,7 +67,10 @@ type Client struct {
 	candidates       []*serverCandidate
 	bestCandidate    *serverCandidate
 	candidateMu      sync.RWMutex
-	lastClientAddr   atomic.Pointer[net.UDPAddr] // Written by localReadLoop, read by handleServerPacket.
+	lastClientAddr   atomic.Pointer[net.UDPAddr] // Game netchannel socket (set by localReadLoop, read by handleServerPacket).
+	a2sQueryAddr     atomic.Pointer[net.UDPAddr] // Server-browser A2S query socket (separate from the game netchannel socket).
+	gameConnAddr     atomic.Pointer[net.UDPAddr] // Current game netchannel socket, for open/close logging.
+	gameConnLastSeen atomic.Int64                // UnixNano of the last packet from the game netchannel socket.
 	router           *router.Router
 	holePuncher      *stun.HolePuncher
 	lastReportedPath router.PathType
@@ -68,6 +78,37 @@ type Client struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
+}
+
+// isA2SQuery reports whether a local payload is a Source Engine server query
+// (A2S challenge / info request, "ff ff ff ff 54 Source Engine Query").
+//
+// The game issues these from its server-browser socket, which is a DIFFERENT
+// UDP socket than the one carrying the netchannel. Responses to it must be
+// routed back to that socket: if they land on the netchannel socket instead,
+// the netchannel sees a spurious 0x41 challenge and disconnects with
+// "Invalid challenge packet".
+func isA2SQuery(payload []byte) bool {
+	return len(payload) > 20 &&
+		payload[0] == 0xFF && payload[1] == 0xFF && payload[2] == 0xFF && payload[3] == 0xFF &&
+		payload[4] == 0x54 && bytes.HasPrefix(payload[5:], []byte("Source Engine Query"))
+}
+
+// isA2SResponse reports whether a relay payload is an A2S response that belongs
+// to the server-browser query socket:
+//
+//   - the A2S challenge response is exactly 9 bytes: ff ff ff ff 41 + 4-byte
+//     challenge. This length distinguishes it from the (much longer) netchannel
+//     connect challenge response, which is also type 0x41.
+//   - the A2S info response (0x49) is always a query response.
+func isA2SResponse(payload []byte) bool {
+	if len(payload) < 5 || payload[0] != 0xFF || payload[1] != 0xFF || payload[2] != 0xFF || payload[3] != 0xFF {
+		return false
+	}
+	if payload[4] == 0x41 {
+		return len(payload) == 9 // A2S challenge response only (connect challenge is longer)
+	}
+	return payload[4] == 0x49 // A2S info response
 }
 
 // NewClient creates a new Client instance.
@@ -620,11 +661,26 @@ func (s *Client) localReadLoop() {
 			}
 		}
 
-		s.lastClientAddr.Store(clientAddr)
 		payload := buf[:n]
 
 		if !protocol.IsL4D2Packet(payload) {
 			continue
+		}
+
+		// The game's server browser queries (A2S) come from a separate UDP
+		// socket than the netchannel. Remember it so the query's response is
+		// routed back to it instead of being dumped on the netchannel socket,
+		// where it looks like a bogus connection challenge and drops the game
+		// with "Invalid challenge packet".
+		if isA2SQuery(payload) {
+			s.a2sQueryAddr.Store(clientAddr)
+			// Do NOT let the query socket overwrite lastClientAddr — that is
+			// the game netchannel socket, which every game response is routed
+			// to. Letting the browser socket clobber it would misroute game
+			// responses to the browser. A2S queries are still forwarded below.
+		} else {
+			s.lastClientAddr.Store(clientAddr)
+			s.trackGameConnection(clientAddr)
 		}
 
 		seq := atomic.AddUint32(&s.seq, 1)
@@ -637,6 +693,36 @@ func (s *Client) localReadLoop() {
 		if activeCand != nil {
 			_ = activeCand.send(pkt.Marshal())
 		}
+	}
+}
+
+// trackGameConnection logs when the game's netchannel socket opens or changes,
+// and records when it was last seen. The game can restart its connection from a
+// new local socket (reconnect after a drop / map change) — knowing when that
+// happens makes the client-side connection lifecycle visible in the log.
+func (s *Client) trackGameConnection(addr *net.UDPAddr) {
+	cur := s.gameConnAddr.Load()
+	if cur == nil {
+		log.Printf("[Client] Game connection socket opened: %s", addr)
+	} else if cur.String() != addr.String() {
+		log.Printf("[Client] Game connection socket changed %s -> %s (reconnect)", cur, addr)
+	}
+	s.gameConnAddr.Store(addr)
+	s.gameConnLastSeen.Store(time.Now().UnixNano())
+}
+
+// checkGameConnectionClosed logs when the game connection socket goes quiet for
+// gameConnIdleTimeout (the game returned to the main menu / disconnected).
+// Called from pingProbeLoop.
+func (s *Client) checkGameConnectionClosed() {
+	addr := s.gameConnAddr.Load()
+	if addr == nil {
+		return
+	}
+	last := s.gameConnLastSeen.Load()
+	if time.Since(time.Unix(0, last)) > gameConnIdleTimeout {
+		log.Printf("[Client] Game connection socket closed (no traffic for %v): %s", gameConnIdleTimeout, addr)
+		s.gameConnAddr.Store(nil)
 	}
 }
 
@@ -841,7 +927,20 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		}
 
 	case protocol.CmdData:
-		if addr := s.lastClientAddr.Load(); addr != nil && len(pkt.Payload) > 0 {
+		if len(pkt.Payload) == 0 {
+			break
+		}
+		// A2S query responses belong to the server-browser socket, NOT the
+		// game's netchannel socket. Sending them to lastClientAddr (the last
+		// local sender — often the netchannel ack) makes the netchannel see a
+		// spurious 0x41 challenge and abort with "Invalid challenge packet".
+		if isA2SResponse(pkt.Payload) {
+			if a2s := s.a2sQueryAddr.Load(); a2s != nil {
+				_, _ = s.localConn.WriteToUDP(pkt.Payload, a2s)
+				break
+			}
+		}
+		if addr := s.lastClientAddr.Load(); addr != nil {
 			_, _ = s.localConn.WriteToUDP(pkt.Payload, addr)
 		}
 	}
@@ -862,6 +961,9 @@ func (s *Client) pingProbeLoop() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			// Log when the game connection socket goes quiet (game left / dropped).
+			s.checkGameConnectionClosed()
+
 			seq := atomic.AddUint32(&s.seq, 1)
 			pingPkt := protocol.NewPacket(protocol.CmdPing, s.sessionID.Load(), seq, []byte("PING"))
 			marshaledPing := pingPkt.Marshal()

@@ -10,9 +10,44 @@ import (
 	"left4proxy/pkg/server"
 )
 
-// TestPathForCandidate verifies the client classifies candidates by the
-// server-provided path hint (relay/direct/punch), falling back to LAN by
-// address and Relay for unknown hints (old server).
+// TestA2SResponseRouting verifies the A2S helpers distinguish the server
+// browser's query/response packets from the game's netchannel connect
+// challenge, so responses are routed to the query socket instead of the
+// netchannel socket (which would otherwise see a spurious 0x41 challenge and
+// drop the player with "Invalid challenge packet").
+func TestA2SResponseRouting(t *testing.T) {
+	// A2S challenge request from the server browser: ff ff ff ff 54 "Source Engine Query".
+	query := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x54}
+	query = append(query, []byte("Source Engine Query")...)
+	if !isA2SQuery(query) {
+		t.Fatalf("isA2SQuery(%x) = false, want true", query)
+	}
+	// The game's netchannel connect packet must NOT be treated as an A2S query.
+	connect := append([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0x71}, []byte("connect0x0BB1626F")...)
+	if isA2SQuery(connect) {
+		t.Fatalf("isA2SQuery(connect) = true, want false")
+	}
+
+	// A2S challenge response is exactly 10 bytes: ff ff ff ff 41 <challenge>.
+	a2sChallenge := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x41, 0x00, 0x11, 0x22, 0x33}
+	if !isA2SResponse(a2sChallenge) {
+		t.Fatalf("isA2SResponse(A2S challenge) = false, want true")
+	}
+	// A2S info response (0x49) is also a query response.
+	a2sInfo := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x49, 'h', 'e', 'l', 'l', 'o'}
+	if !isA2SResponse(a2sInfo) {
+		t.Fatalf("isA2SResponse(A2S info) = false, want true")
+	}
+	// The netchannel connect challenge response (type 0x41, but much longer
+	// than 10 bytes) must NOT be treated as an A2S response — it is delivered
+	// to the game's netchannel socket normally.
+	connectChallenge := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x41, 0x6f, 0x62, 0xb1, 0x0b, 0x03, 0x00, 0x00, 0x00}
+	if isA2SResponse(connectChallenge) {
+		t.Fatalf("isA2SResponse(connect challenge) = true, want false")
+	}
+}
+
+
 func TestPathForCandidate(t *testing.T) {
 	c := &Client{}
 
