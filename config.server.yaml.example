@@ -1,0 +1,25 @@
+# Left4Proxy 服务端配置文件示例 (config.server.yaml)
+
+# 1. 服务端监听端口 (默认监听所有网卡 0.0.0.0)
+listen_addr: ":27014"
+
+# 如果服务器有多个网卡或需要绑定多个特定端口/IP：
+listen_addrs:
+  - "0.0.0.0:27014"
+  - "[::]:27014"
+
+# 2. 目标求生之路 2 专用服务器 (Upstream Target)
+target_addr: "127.0.0.1:27015"
+
+# 3. PROXY Protocol v2 支持
+# 当开启时，服务端在转发 UDP 包前会附加 PROXY Protocol v2 报文头，向下游传递客户端真实 IP
+proxy_protocol_v2: false
+
+# 4. 服务器声明的外部公网 IP / 域名列表 (供反射打洞与客户端分配使用)
+public_ips:
+  - "119.29.1.1"
+  - "182.92.2.2"
+  - "l4d2.example.com"
+
+# 5. 打洞 / 穿透对等端口
+direct_port_range: "27015"
