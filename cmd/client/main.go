@@ -20,6 +20,7 @@ func main() {
 		serverAddr  string
 		listenAddr  string
 		mode        string
+		stunServer  string
 		showVersion bool
 	)
 
@@ -31,6 +32,7 @@ func main() {
 	flag.StringVar(&listenAddr, "listen", "", "Local listen address override (default: 127.0.0.2:27015)")
 	flag.StringVar(&mode, "m", "", "Route mode override: auto, direct-only, relay-only")
 	flag.StringVar(&mode, "mode", "", "Route mode override: auto, direct-only, relay-only")
+	flag.StringVar(&stunServer, "stun-server", "", "Public STUN server for punch-socket reflection")
 	flag.BoolVar(&showVersion, "v", false, "Show version")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
 
@@ -60,6 +62,9 @@ func main() {
 	}
 	if setFlags["m"] || setFlags["mode"] {
 		cfg.Mode = mode
+	}
+	if setFlags["stun-server"] {
+		cfg.StunServer = stunServer
 	}
 
 	cli, err := client.NewClient(cfg)

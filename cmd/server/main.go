@@ -20,6 +20,8 @@ func main() {
 		listenAddr      string
 		targetAddr      string
 		proxyProtocolV2 bool
+		stunServer      string
+		punchAddr       string
 		showVersion     bool
 	)
 
@@ -29,6 +31,8 @@ func main() {
 	flag.StringVar(&listenAddr, "listen", "", "Listen address override (e.g. :27014)")
 	flag.StringVar(&targetAddr, "u", "", "Upstream L4D2 server target override (e.g. 127.0.0.1:27015)")
 	flag.StringVar(&targetAddr, "target", "", "Upstream L4D2 server target override (e.g. 127.0.0.1:27015)")
+	flag.StringVar(&stunServer, "stun-server", "", "Public STUN server for discovering this server's public endpoint")
+	flag.StringVar(&punchAddr, "punch-addr", "", "Manual override for the public punch endpoint (ip:port); empty = STUN auto-discovery")
 	flag.BoolVar(&proxyProtocolV2, "proxy-protocol", false, "Enable PROXY protocol v1/v2 parsing from frp/HAProxy")
 	flag.BoolVar(&showVersion, "v", false, "Show version")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
@@ -59,6 +63,12 @@ func main() {
 	}
 	if setFlags["proxy-protocol"] {
 		cfg.ProxyProtocolV2 = proxyProtocolV2
+	}
+	if setFlags["stun-server"] {
+		cfg.StunServer = stunServer
+	}
+	if setFlags["punch-addr"] {
+		cfg.PunchAddr = punchAddr
 	}
 
 	srv, err := server.NewServer(cfg)

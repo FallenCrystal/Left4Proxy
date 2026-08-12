@@ -56,6 +56,25 @@ func TestRouterPunch(t *testing.T) {
 	}
 }
 
+func TestRouterReportsPunchWhenRelayDown(t *testing.T) {
+	r := NewRouter("auto")
+
+	// Punch is active but slower than Relay's stale RTT; while Relay is alive it
+	// wins (the healthy case).
+	r.UpdateMetrics(PathPunch, 300*time.Millisecond, 0.0)
+	r.UpdateMetrics(PathRelay, 50*time.Millisecond, 0.0)
+	if r.CurrentPath() != PathRelay {
+		t.Fatalf("expected Relay while active, got %s", r.CurrentPath())
+	}
+
+	// Relay goes down -> punch must be reported as the active path even though
+	// its RTT is worse than the stale Relay value.
+	r.SetInactive(PathRelay)
+	if r.CurrentPath() != PathPunch {
+		t.Fatalf("expected Punch when Relay is down, got %s", r.CurrentPath())
+	}
+}
+
 func TestRouterModes(t *testing.T) {
 	rRelay := NewRouter("relay-only")
 	rRelay.UpdateMetrics(PathDirect, 5*time.Millisecond, 0.0)

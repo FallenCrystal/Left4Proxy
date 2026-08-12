@@ -23,12 +23,14 @@ const maxSessions = 2048
 
 // clientSession tracks one client's state on the server.
 type clientSession struct {
-	mu             sync.RWMutex // Guards rawSenderAddr / realClientAddr / lastActive.
+	mu             sync.RWMutex // Guards rawSenderAddr / realClientAddr / lastActive / punchTarget.
 	sessionID      uint64
 	rawSenderAddr  *net.UDPAddr // Socket return path (frpc or direct UDP client)
 	realClientAddr *net.UDPAddr // Extracted real client public IP:Port (from PROXY protocol or direct)
 	lastActive     time.Time
-	upstreamMu     sync.Mutex // Guards upstream dial/close.
+	punchTarget    *net.UDPAddr // Client's punch-socket public endpoint (from CmdPunchInit); probed to open the server-side hole.
+	punchExpiry    time.Time    // When to stop probing the punch target.
+	upstreamMu     sync.Mutex   // Guards upstream dial/close.
 	upstream       *net.UDPConn
 }
 
@@ -48,6 +50,9 @@ type Server struct {
 	stunProbeLogged   map[string]bool            // Dedup so only the first STUN probe per sender is logged.
 	proxyAddrMu       sync.RWMutex
 	sessionMu         sync.RWMutex
+	serverPubMu       sync.RWMutex // Guards serverPublic.
+	serverPublic      *net.UDPAddr // The server's NAT-mapped public endpoint (advertised so clients can punch to it).
+	stunAddr          *net.UDPAddr // Resolved public STUN server. Written only by discoverPublicEndpointLoop.
 	nextID            uint64
 	behindNAT         bool // Whether the server has no public interface IP (for direct vs punch labeling).
 	ctx               context.Context
@@ -90,9 +95,10 @@ func (s *Server) Start() error {
 	log.Printf("[Server] Left4Proxy Server listening on UDP %s | Target L4D2: %s | PROXY Protocol Parser: %v",
 		s.cfg.ListenAddr, s.cfg.TargetAddr, s.cfg.ProxyProtocolV2)
 
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.readUDPDataLoop()
 	go s.cleanupSessionsLoop()
+	go s.discoverPublicEndpointLoop()
 
 	return nil
 }
@@ -125,6 +131,17 @@ func (s *Server) readUDPDataLoop() {
 		}
 
 		packetData := buf[:n]
+
+		// A STUN Binding Response from the public STUN server reveals this
+		// socket's NAT-mapped public endpoint (what clients should punch to).
+		// It is not an L4DP packet, so handle it and move on.
+		if stun.IsStunResponse(packetData) {
+			if addr, perr := stun.ParseBindingResponse(packetData); perr == nil {
+				s.updateServerPublic(addr)
+			}
+			continue
+		}
+
 		realClientAddr := rawSenderAddr
 
 		// If ProxyProtocol is enabled on server, parse incoming PROXY protocol v1/v2 header from frp/HAProxy
@@ -177,6 +194,127 @@ func (s *Server) readUDPDataLoop() {
 		}
 
 		s.handlePacket(pkt, rawSenderAddr, realClientAddr)
+	}
+}
+
+// publicEndpointString returns the server's known public punch endpoint, or ""
+// if not yet discovered.
+func (s *Server) publicEndpointString() string {
+	s.serverPubMu.RLock()
+	defer s.serverPubMu.RUnlock()
+	if s.serverPublic == nil {
+		return ""
+	}
+	return s.serverPublic.String()
+}
+
+// updateServerPublic records a discovered public endpoint and, when it changes,
+// pushes a CmdPunchOffer to every live session so already-connected clients can
+// start punching.
+func (s *Server) updateServerPublic(addr *net.UDPAddr) {
+	s.serverPubMu.Lock()
+	changed := s.serverPublic == nil || s.serverPublic.String() != addr.String()
+	if changed {
+		s.serverPublic = addr
+	}
+	s.serverPubMu.Unlock()
+
+	if changed {
+		log.Printf("[Server] Public endpoint discovered -> %s", addr)
+		s.broadcastPunchOffer()
+	}
+}
+
+// broadcastPunchOffer tells every live session the server's public punch
+// endpoint, so clients that connected before discovery can still punch.
+func (s *Server) broadcastPunchOffer() {
+	offer := s.publicEndpointString()
+	if offer == "" {
+		return
+	}
+	pkt := protocol.NewPacket(protocol.CmdPunchOffer, 0, 0, []byte(offer))
+	data := pkt.Marshal()
+
+	s.sessionMu.RLock()
+	defer s.sessionMu.RUnlock()
+	for _, sess := range s.sessions {
+		sess.mu.RLock()
+		dst := sess.rawSenderAddr
+		sess.mu.RUnlock()
+		if dst != nil {
+			_, _ = s.udpConn.WriteToUDP(data, dst)
+		}
+	}
+}
+
+// sendStunBindingRequest sends a STUN Binding Request from the main listener
+// socket so the NAT reveals the server's public endpoint.
+func (s *Server) sendStunBindingRequest() {
+	if s.stunAddr == nil {
+		addr, err := net.ResolveUDPAddr("udp", s.cfg.StunServer)
+		if err != nil {
+			log.Printf("[Server] Bad stun_server %q: %v", s.cfg.StunServer, err)
+			return
+		}
+		s.stunAddr = addr
+	}
+	_, _ = s.udpConn.WriteToUDP(stun.BuildBindingRequest(), s.stunAddr)
+}
+
+// discoverPublicEndpointLoop determines the server's public punch endpoint. If
+// punch_addr is configured it is used directly (manual override). Otherwise the
+// server periodically sends a STUN Binding Request and records the reflected
+// endpoint when the response arrives in readUDPDataLoop.
+func (s *Server) discoverPublicEndpointLoop() {
+	defer s.wg.Done()
+
+	if s.cfg.PunchAddr != "" {
+		addr, err := net.ResolveUDPAddr("udp", s.cfg.PunchAddr)
+		if err != nil {
+			log.Printf("[Server] Invalid punch_addr %q: %v", s.cfg.PunchAddr, err)
+		} else {
+			s.updateServerPublic(addr)
+			log.Printf("[Server] Using manual punch_addr override -> %s", addr)
+		}
+		return
+	}
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		s.sendStunBindingRequest()
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// punchProbeLoop sends CmdStunProbe packets from the main listener socket to a
+// client's direct socket. These outbound probes create the server-side NAT
+// mapping that lets the client's direct packets in, even on restricted-cone
+// NATs. Stops once the punch expires or the server is shutting down.
+func (s *Server) punchProbeLoop(sess *clientSession, target *net.UDPAddr) {
+	defer s.wg.Done()
+	probe := protocol.NewPacket(protocol.CmdStunProbe, sess.sessionID, 0, []byte("PUNCH"))
+	data := probe.Marshal()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		sess.mu.RLock()
+		expired := time.Now().After(sess.punchExpiry)
+		sess.mu.RUnlock()
+		if expired {
+			return
+		}
+		_, _ = s.udpConn.WriteToUDP(data, target)
 	}
 }
 
@@ -269,6 +407,12 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		} else {
 			respPayload = fmt.Sprintf("%s||%s", reflected, pathHint)
 		}
+		// 4th field: the server's public punch endpoint, when known. Old clients
+		// read only the first three fields and ignore this; new clients use it to
+		// establish a direct (punched) path.
+		if sp := s.publicEndpointString(); sp != "" {
+			respPayload += "|" + sp
+		}
 
 		// Echo back client's sent timestamp for instant RTT calculation during handshake
 		respPkt := &protocol.Packet{
@@ -308,6 +452,36 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 			log.Printf("[Server] STUN probe from %s (real %s, sid=%d) -> ack sent, wErr=%v", rawSenderAddr, realClientAddr, pkt.SessionID, wErr)
 		}
 
+	case protocol.CmdPunchInit:
+		// A client asking us to open a hole toward its direct (punch) socket.
+		// The payload is the client's public endpoint on that socket. We reply
+		// over the control (relay) channel and start probing the target, which
+		// creates the server-side NAT mapping that lets the client's direct
+		// packets through even on restricted-cone NATs.
+		if pkt.SessionID == 0 {
+			return
+		}
+		target, perr := stun.ParseReflectedAddress(string(pkt.Payload))
+		if perr != nil || target == nil {
+			log.Printf("[Server] Bad PunchInit payload %q: %v", pkt.Payload, perr)
+			return
+		}
+		s.sessionMu.RLock()
+		sess := s.sessions[pkt.SessionID]
+		s.sessionMu.RUnlock()
+		if sess == nil {
+			return
+		}
+		sess.mu.Lock()
+		sess.punchTarget = target
+		sess.punchExpiry = time.Now().Add(30 * time.Second)
+		sess.mu.Unlock()
+		ack := protocol.NewPacket(protocol.CmdPunchAck, pkt.SessionID, pkt.Seq, []byte("PUNCH_INIT_OK"))
+		_, _ = s.udpConn.WriteToUDP(ack.Marshal(), rawSenderAddr)
+		log.Printf("[Server] PunchInit (sid=%d) target %s via sender %s", pkt.SessionID, target, rawSenderAddr)
+		s.wg.Add(1)
+		go s.punchProbeLoop(sess, target)
+
 	case protocol.CmdPing:
 		// Keep idle-but-alive sessions (and their stable upstream socket) from being
 		// reaped, otherwise a re-dialed upstream would change the source port the
@@ -333,6 +507,10 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		}
 		_, _ = s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
 
+	case protocol.CmdPunchOffer, protocol.CmdPunchAck:
+		// The server never sends itself a PunchOffer and only receives a
+		// PunchAck as a client echo — nothing to do. Kept for symmetry.
+
 	case protocol.CmdData:
 		// A zero session ID means the client hasn't completed its handshake yet.
 		// Accepting it here would merge every pre-handshake client into one session.
@@ -344,6 +522,12 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		if sess != nil {
 			sess.mu.Lock()
 			sess.lastActive = time.Now()
+			// Direct data from the punch socket means migration happened — stop
+			// the server-side hole-opening probes (the direct path now carries
+			// the data and our replies keep the mapping alive).
+			if sess.punchTarget != nil && sess.punchTarget.IP.Equal(rawSenderAddr.IP) && sess.punchTarget.Port == rawSenderAddr.Port {
+				sess.punchExpiry = time.Now()
+			}
 			sess.mu.Unlock()
 			s.forwardToUpstream(sess, pkt.Payload)
 		}

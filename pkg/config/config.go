@@ -11,6 +11,10 @@ import (
 const DefaultServerConfigPath = "config.server.yaml"
 const DefaultClientConfigPath = "config.client.yaml"
 
+// DefaultPublicStunServer is used when no stun_server is configured. It must
+// be reachable over outbound UDP 3478.
+const DefaultPublicStunServer = "stun.cloudflare.com:3478"
+
 // ClientConfig holds settings for the Left4Proxy client.
 type ClientConfig struct {
 	ServerAddrs  []string `yaml:"server_addrs"`  // Server external IPs/domains
@@ -20,6 +24,7 @@ type ClientConfig struct {
 	EnableLAN    bool     `yaml:"enable_lan"`    // Enable LAN detection (default: true)
 	EnablePunch  bool     `yaml:"enable_punch"`  // Enable UDP hole punching (default: true)
 	PingInterval int      `yaml:"ping_interval"` // Ping probe interval in seconds (default: 3)
+	StunServer   string   `yaml:"stun_server"`   // Public STUN server for punch-socket reflection (default: stun.cloudflare.com:3478)
 }
 
 // ServerConfig holds settings for the Left4Proxy server.
@@ -31,6 +36,8 @@ type ServerConfig struct {
 	PublicIPs       []string `yaml:"public_ips"`        // List of server public IPs/domains to announce
 	DirectPortRange string   `yaml:"direct_port_range"` // Direct STUN / hole-punch port range or explicit port
 	NAT             string   `yaml:"nat"`               // "auto" (default) | "true" | "false" — whether the server sits behind NAT (no public IP)
+	StunServer      string   `yaml:"stun_server"`       // Public STUN server used to discover the server's own public endpoint (default: stun.cloudflare.com:3478)
+	PunchAddr       string   `yaml:"punch_addr"`        // Manual override for the server's public punch endpoint (ip:port); empty = auto STUN discovery
 }
 
 // DefaultClientConfig returns default client settings.
@@ -43,6 +50,7 @@ func DefaultClientConfig() *ClientConfig {
 		EnableLAN:    true,
 		EnablePunch:  true,
 		PingInterval: 3,
+		StunServer:   DefaultPublicStunServer,
 	}
 }
 
@@ -55,6 +63,8 @@ func DefaultServerConfig() *ServerConfig {
 		Secret:          "",
 		PublicIPs:       []string{},
 		DirectPortRange: "27015",
+		StunServer:      DefaultPublicStunServer,
+		PunchAddr:       "",
 	}
 }
 
@@ -105,6 +115,7 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		EnableLAN    bool     `yaml:"enable_lan"`
 		EnablePunch  bool     `yaml:"enable_punch"`
 		PingInterval int      `yaml:"ping_interval"`
+		StunServer   string   `yaml:"stun_server"`
 	}
 
 	var raw rawClientConfig
@@ -125,6 +136,9 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	cfg.EnablePunch = raw.EnablePunch
 	if raw.PingInterval > 0 {
 		cfg.PingInterval = raw.PingInterval
+	}
+	if raw.StunServer != "" {
+		cfg.StunServer = raw.StunServer
 	}
 
 	cfg.ServerAddrs = []string{}
@@ -170,6 +184,8 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		PublicIPs       []string `yaml:"public_ips"`
 		DirectPortRange string   `yaml:"direct_port_range"`
 		NAT             string   `yaml:"nat"`
+		StunServer      string   `yaml:"stun_server"`
+		PunchAddr       string   `yaml:"punch_addr"`
 	}
 
 	var raw rawServerConfig
@@ -190,6 +206,10 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	cfg.PublicIPs = raw.PublicIPs
 	cfg.DirectPortRange = raw.DirectPortRange
 	cfg.NAT = raw.NAT
+	if raw.StunServer != "" {
+		cfg.StunServer = raw.StunServer
+	}
+	cfg.PunchAddr = raw.PunchAddr
 
 	log.Printf("[Config] Loaded server configuration from: %s", path)
 	return cfg, nil

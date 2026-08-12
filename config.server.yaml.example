@@ -22,5 +22,13 @@ public_ips:
   - "182.92.2.2"
   - "l4d2.example.com"
 
-# 6. (预留) 打洞 / 穿透对等端口 —— 当前版本尚未使用
+# 6. 公网 STUN 服务器 (用于打洞: 让 NAT 后的服务端反射出自己的公网端点)
+# 需要可出站访问 UDP 3478。若服务端有端口映射/固定公网端口, 也可用 punch_addr 手动指定。
+stun_server: "stun.cloudflare.com:3478"
+
+# 7. (可选) 手动指定服务端公网打洞端点 (ip:port)。
+# 为空时自动用 stun_server 反射发现; 设置后跳过 STUN, 直接采用该值 (例如已有端口映射时)。
+punch_addr: ""
+
+# 8. (预留) 打洞 / 穿透对等端口 —— 当前版本尚未使用
 direct_port_range: "27015"

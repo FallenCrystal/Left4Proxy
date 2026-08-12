@@ -22,5 +22,9 @@ mode: "auto"
 
 # 4. 优化开关
 enable_lan: true      # 开启本地局域网广播检测 (同局域网内免走公网绕路)
-enable_punch: true    # 开启 UDP STUN 尽力而为打洞
+enable_punch: true    # 开启 UDP 打洞 (服务端在 NAT 后时, 为玩家打洞直连、绕过 frp 中继)
 ping_interval: 3      # 线路延迟探测与打洞心跳间隔 (秒)
+
+# 5. 公网 STUN 服务器 (用于打洞套接字反射出自己的公网端点)
+# 需要可出站访问 UDP 3478。
+stun_server: "stun.cloudflare.com:3478"

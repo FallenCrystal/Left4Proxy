@@ -23,6 +23,9 @@ const (
 	CmdPing          byte = 0x07
 	CmdPong          byte = 0x08
 	CmdData          byte = 0x09
+	CmdPunchOffer    byte = 0x0A // server→client: server's public punch endpoint (ip:port)
+	CmdPunchInit     byte = 0x0B // client→server (over relay): client's direct-socket public endpoint
+	CmdPunchAck      byte = 0x0C // server→client: PunchInit acknowledged
 
 	HeaderSize = 28 // 4 + 1 + 1 + 8 + 4 + 8 + 2
 )
