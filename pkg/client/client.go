@@ -30,13 +30,13 @@ type serverCandidate struct {
 // Client is the Left4Proxy client daemon.
 type Client struct {
 	cfg              *config.ClientConfig
-	sessionID        uint64
+	sessionID        atomic.Uint64 // Written by handshake responses, read by senders — must be atomic.
 	seq              uint32
 	localConn        *net.UDPConn
 	candidates       []*serverCandidate
 	bestCandidate    *serverCandidate
 	candidateMu      sync.RWMutex
-	lastClientAddr   *net.UDPAddr
+	lastClientAddr   atomic.Pointer[net.UDPAddr] // Written by localReadLoop, read by handleServerPacket.
 	router           *router.Router
 	holePuncher      *stun.HolePuncher
 	lastReportedPath router.PathType
@@ -100,7 +100,7 @@ func (s *Client) Start() error {
 
 	// 4. Start Hole Puncher & Background Loops
 	if s.cfg.EnablePunch && s.bestCandidate != nil {
-		s.holePuncher = stun.NewHolePuncher(s.sessionID, s.bestCandidate.conn, s.bestCandidate.udpAddr)
+		s.holePuncher = stun.NewHolePuncher(s.sessionID.Load(), s.bestCandidate.conn, s.bestCandidate.udpAddr)
 		s.holePuncher.StartPunching(3 * time.Second)
 	}
 
@@ -180,6 +180,16 @@ func (s *Client) selectBestCandidate() {
 		isLAN := cand.isLAN
 		cand.mu.RUnlock()
 
+		// Apply the routing mode and LAN preference from the config, otherwise the
+		// configured mode would have no effect on which candidate actually carries data.
+		if isLAN {
+			if !s.cfg.EnableLAN || s.cfg.Mode == "relay-only" {
+				continue
+			}
+		} else if s.cfg.Mode == "direct-only" {
+			continue
+		}
+
 		if online && !lastActive.IsZero() && now.Sub(lastActive) <= 15*time.Second {
 			effRTT := rtt
 			if isLAN {
@@ -200,13 +210,18 @@ func (s *Client) selectBestCandidate() {
 			currLAN := s.bestCandidate.isLAN
 			s.bestCandidate.mu.RUnlock()
 
-			if !best.isLAN && currLAN {
+			best.mu.RLock()
+			bestLAN := best.isLAN
+			bestRTT := best.rtt
+			best.mu.RUnlock()
+
+			if !bestLAN && currLAN {
 				// Don't switch away from LAN to WAN
 				return
 			}
 
-			if !best.isLAN && !currLAN {
-				improvement := currRTT - best.rtt
+			if !bestLAN && !currLAN {
+				improvement := currRTT - bestRTT
 				if improvement < 5*time.Millisecond && improvement < currRTT/7 {
 					// Latency improvement too small, avoid flapping
 					return
@@ -252,7 +267,7 @@ func (s *Client) localReadLoop() {
 			}
 		}
 
-		s.lastClientAddr = clientAddr
+		s.lastClientAddr.Store(clientAddr)
 		payload := buf[:n]
 
 		if !protocol.IsL4D2Packet(payload) {
@@ -260,7 +275,7 @@ func (s *Client) localReadLoop() {
 		}
 
 		seq := atomic.AddUint32(&s.seq, 1)
-		pkt := protocol.NewPacket(protocol.CmdData, s.sessionID, seq, payload)
+		pkt := protocol.NewPacket(protocol.CmdData, s.sessionID.Load(), seq, payload)
 
 		s.candidateMu.RLock()
 		activeCand := s.bestCandidate
@@ -314,24 +329,39 @@ func (s *Client) candidateReadLoop(cand *serverCandidate) {
 
 // handleServerPacket handles all incoming server packets from a candidate socket.
 func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet) {
-	now := time.Now().UnixNano()
-	handshakeRTT := time.Duration(now - pkt.Timestamp)
-
 	cand.mu.Lock()
 	cand.lastActive = time.Now()
 	cand.online = true
-	if handshakeRTT > 0 && handshakeRTT < 10*time.Second {
-		cand.rtt = handshakeRTT
-	}
-	candRTT := cand.rtt
-	isLAN := cand.isLAN
 	cand.mu.Unlock()
+
+	// RTT is only meaningful when the server echoed the client's own timestamp
+	// (HandshakeResp and Pong). For CmdData etc. the server stamps its own clock,
+	// so measuring RTT there would mix clock skew into the result.
+	if pkt.Cmd == protocol.CmdHandshakeResp || pkt.Cmd == protocol.CmdPong {
+		rtt := time.Duration(time.Now().UnixNano() - pkt.Timestamp)
+		if rtt > 0 && rtt < 10*time.Second {
+			cand.mu.Lock()
+			cand.rtt = rtt
+			cand.mu.Unlock()
+		}
+	}
 
 	switch pkt.Cmd {
 	case protocol.CmdHandshakeResp:
-		if s.sessionID == 0 {
-			s.sessionID = pkt.SessionID
+		// Adopt the FIRST session ID the server assigns and keep it for the whole
+		// session. The server keeps ONE upstream socket per session ID, so changing
+		// the ID later would make it re-dial the L4D2 server from a new source port
+		// and drop the player mid-game. Leftover IDs from before a server restart are
+		// safe because the server seeds its ID counter randomly (server.NewServer),
+		// so a fresh client can never collide with a stale pre-restart ID.
+		if pkt.SessionID != 0 {
+			s.sessionID.CompareAndSwap(0, pkt.SessionID)
 		}
+
+		cand.mu.RLock()
+		candRTT := cand.rtt
+		isLAN := cand.isLAN
+		cand.mu.RUnlock()
 
 		payloadStr := string(pkt.Payload)
 		parts := strings.Split(payloadStr, "|")
@@ -342,6 +372,9 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 
 		if isLAN {
 			s.router.UpdateMetrics(router.PathLAN, candRTT, 0.0)
+		} else if s.cfg.Mode == "relay-only" {
+			// In relay-only mode a non-LAN candidate is the relay path.
+			s.router.UpdateMetrics(router.PathRelay, candRTT, 0.0)
 		} else {
 			s.router.UpdateMetrics(router.PathDirect, candRTT, 0.0)
 		}
@@ -362,12 +395,19 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		s.selectBestCandidate()
 
 	case protocol.CmdPong:
+		cand.mu.RLock()
+		isLAN := cand.isLAN
+		candRTT := cand.rtt
+		cand.mu.RUnlock()
+
 		if isLAN {
 			s.router.UpdateMetrics(router.PathLAN, candRTT, 0.0)
+		} else if s.cfg.Mode == "relay-only" {
+			// In relay-only mode a non-LAN candidate is the relay path.
+			s.router.UpdateMetrics(router.PathRelay, candRTT, 0.0)
 		} else {
 			s.router.UpdateMetrics(router.PathDirect, candRTT, 0.0)
 		}
-
 		s.selectBestCandidate()
 
 	case protocol.CmdLanAck:
@@ -383,8 +423,8 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		s.selectBestCandidate()
 
 	case protocol.CmdData:
-		if s.lastClientAddr != nil && len(pkt.Payload) > 0 {
-			_, _ = s.localConn.WriteToUDP(pkt.Payload, s.lastClientAddr)
+		if addr := s.lastClientAddr.Load(); addr != nil && len(pkt.Payload) > 0 {
+			_, _ = s.localConn.WriteToUDP(pkt.Payload, addr)
 		}
 	}
 }
@@ -405,7 +445,7 @@ func (s *Client) pingProbeLoop() {
 			return
 		case <-ticker.C:
 			seq := atomic.AddUint32(&s.seq, 1)
-			pingPkt := protocol.NewPacket(protocol.CmdPing, s.sessionID, seq, []byte("PING"))
+			pingPkt := protocol.NewPacket(protocol.CmdPing, s.sessionID.Load(), seq, []byte("PING"))
 			marshaledPing := pingPkt.Marshal()
 
 			s.candidateMu.RLock()

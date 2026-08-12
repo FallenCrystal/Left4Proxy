@@ -78,7 +78,7 @@ public_ips: []
 direct_port_range: "27015"
 ```
 
-- `listen_addr`: 服务端 UDP/TCP 监听地址。
+- `listen_addr`: 服务端 UDP 监听地址。
 - `target_addr`: 实际 L4D2 服务器监听地址。
 - `proxy_protocol_v2`: 是否开启 PROXY Protocol v1/v2 解析（配合 frp/HAProxy 使用）。
 - `public_ips`: 服务端广播给客户端的候选节点地址列表（包含局域网 IP 与公网域名/IP）。

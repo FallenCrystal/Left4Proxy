@@ -9,6 +9,72 @@ import (
 	"left4proxy/pkg/server"
 )
 
+// mkCand builds a serverCandidate with the given characteristics for routing tests.
+func mkCand(addr string, rtt time.Duration, online, lan bool) *serverCandidate {
+	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
+	return &serverCandidate{
+		addrStr:    addr,
+		udpAddr:    udpAddr,
+		online:     online,
+		rtt:        rtt,
+		isLAN:      lan,
+		lastActive: time.Now(),
+	}
+}
+
+func TestClientModeRouting(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+
+	lan := mkCand("192.168.1.5:27014", 1*time.Millisecond, true, true)
+	wanSlow := mkCand("203.0.113.1:27014", 50*time.Millisecond, true, false)
+	wanFast := mkCand("198.51.100.1:27014", 20*time.Millisecond, true, false)
+
+	c := &Client{cfg: cfg}
+
+	// relay-only: LAN candidates must be excluded.
+	cfg.Mode = "relay-only"
+	c.candidates = []*serverCandidate{lan, wanSlow}
+	c.bestCandidate = wanSlow
+	c.selectBestCandidate()
+	if c.bestCandidate != wanSlow {
+		t.Fatalf("relay-only: expected WAN candidate, got %s", c.bestCandidate.addrStr)
+	}
+
+	// direct-only: non-LAN candidates must be excluded.
+	cfg.Mode = "direct-only"
+	c.bestCandidate = lan
+	c.selectBestCandidate()
+	if c.bestCandidate != lan {
+		t.Fatalf("direct-only: expected LAN candidate, got %s", c.bestCandidate.addrStr)
+	}
+
+	// enable_lan=false: LAN excluded even in auto mode.
+	cfg.Mode = "auto"
+	cfg.EnableLAN = false
+	c.candidates = []*serverCandidate{lan, wanSlow}
+	c.bestCandidate = wanSlow
+	c.selectBestCandidate()
+	if c.bestCandidate != wanSlow {
+		t.Fatalf("enable_lan=false: expected WAN candidate, got %s", c.bestCandidate.addrStr)
+	}
+
+	// auto with LAN enabled: LAN candidate wins over lower effective RTT.
+	cfg.EnableLAN = true
+	c.bestCandidate = wanSlow
+	c.selectBestCandidate()
+	if c.bestCandidate != lan {
+		t.Fatalf("auto: expected LAN candidate, got %s", c.bestCandidate.addrStr)
+	}
+
+	// WAN -> WAN switch with meaningful RTT improvement must be honored.
+	c.candidates = []*serverCandidate{wanSlow, wanFast}
+	c.bestCandidate = wanSlow
+	c.selectBestCandidate()
+	if c.bestCandidate != wanFast {
+		t.Fatalf("auto: expected faster WAN candidate, got %s", c.bestCandidate.addrStr)
+	}
+}
+
 func TestClientServerIntegration(t *testing.T) {
 	// 1. Setup mock upstream L4D2 server
 	upstreamConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 27015})

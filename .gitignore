@@ -1,0 +1,17 @@
+# Compiled binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary / coverage
+*.test
+*.out
+
+# Editor / OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
