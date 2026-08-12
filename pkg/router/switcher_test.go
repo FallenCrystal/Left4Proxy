@@ -33,6 +33,29 @@ func TestRouterAutoSelection(t *testing.T) {
 	}
 }
 
+func TestRouterPunch(t *testing.T) {
+	r := NewRouter("auto")
+
+	// Punch is a direct-tier path and should be selected when it is the best one.
+	r.UpdateMetrics(PathPunch, 20*time.Millisecond, 0.0)
+	if r.CurrentPath() != PathPunch {
+		t.Errorf("expected PathPunch when Punch is the best direct-tier path, got %s", r.CurrentPath())
+	}
+
+	// Relay with much better RTT should win over Punch.
+	r.UpdateMetrics(PathPunch, 80*time.Millisecond, 0.0)
+	r.UpdateMetrics(PathRelay, 5*time.Millisecond, 0.0)
+	if r.CurrentPath() != PathRelay {
+		t.Errorf("expected Relay when its RTT beats Punch, got %s", r.CurrentPath())
+	}
+
+	// LAN still outranks Punch.
+	r.UpdateMetrics(PathLAN, 1*time.Millisecond, 0.0)
+	if r.CurrentPath() != PathLAN {
+		t.Errorf("expected LAN when active, got %s", r.CurrentPath())
+	}
+}
+
 func TestRouterModes(t *testing.T) {
 	rRelay := NewRouter("relay-only")
 	rRelay.UpdateMetrics(PathDirect, 5*time.Millisecond, 0.0)

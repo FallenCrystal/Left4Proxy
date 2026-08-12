@@ -6,8 +6,43 @@ import (
 	"time"
 
 	"left4proxy/pkg/config"
+	"left4proxy/pkg/router"
 	"left4proxy/pkg/server"
 )
+
+// TestPathForCandidate verifies the client classifies candidates by the
+// server-provided path hint (relay/direct/punch), falling back to LAN by
+// address and Relay for unknown hints (old server).
+func TestPathForCandidate(t *testing.T) {
+	c := &Client{}
+
+	lan := mkCand("192.168.1.5:27014", 0, false, true)
+	relay := mkCand("1.2.3.4:27014", 0, false, false)
+	relay.pathHint = "relay"
+	direct := mkCand("5.6.7.8:27014", 0, false, false)
+	direct.pathHint = "direct"
+	punch := mkCand("9.9.9.9:27014", 0, false, false)
+	punch.pathHint = "punch"
+	unknown := mkCand("8.8.8.8:27014", 0, false, false) // no hint yet (old server / pre-handshake)
+
+	got := func(cand *serverCandidate) router.PathType { return c.pathForCandidate(cand) }
+
+	if got(lan) != router.PathLAN {
+		t.Errorf("expected LAN for lan candidate, got %s", got(lan))
+	}
+	if got(relay) != router.PathRelay {
+		t.Errorf("expected Relay for relay candidate, got %s", got(relay))
+	}
+	if got(direct) != router.PathDirect {
+		t.Errorf("expected Direct for direct candidate, got %s", got(direct))
+	}
+	if got(punch) != router.PathPunch {
+		t.Errorf("expected Punch for punch candidate, got %s", got(punch))
+	}
+	if got(unknown) != router.PathRelay {
+		t.Errorf("expected Relay default for unknown hint, got %s", got(unknown))
+	}
+}
 
 // mkCand builds a serverCandidate with the given characteristics for routing tests.
 func mkCand(addr string, rtt time.Duration, online, lan bool) *serverCandidate {

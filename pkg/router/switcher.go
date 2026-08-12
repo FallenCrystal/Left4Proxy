@@ -11,6 +11,7 @@ type PathType string
 const (
 	PathLAN    PathType = "LAN"
 	PathDirect PathType = "Direct"
+	PathPunch  PathType = "Punch"
 	PathRelay  PathType = "Relay"
 )
 
@@ -41,6 +42,7 @@ func NewRouter(mode string) *Router {
 		stats: map[PathType]*PathStats{
 			PathLAN:    {RTT: 1 * time.Millisecond, LossRate: 0, Active: false},
 			PathDirect: {RTT: 999 * time.Millisecond, LossRate: 0, Active: false},
+			PathPunch:  {RTT: 999 * time.Millisecond, LossRate: 0, Active: false},
 			PathRelay:  {RTT: 999 * time.Millisecond, LossRate: 0, Active: true}, // Relay is always available as fallback
 		},
 		current: PathRelay,
@@ -91,9 +93,17 @@ func (r *Router) evaluatePath() {
 
 	switch r.mode {
 	case "direct-only":
-		if r.stats[PathLAN].Active {
+		if stLAN, ok := r.stats[PathLAN]; ok && stLAN.Active {
 			r.current = PathLAN
-		} else {
+			return
+		}
+		// Direct-tier paths (Direct or Punch) — pick the lower RTT.
+		stDir, okDir := r.stats[PathDirect]
+		stPunch, okPunch := r.stats[PathPunch]
+		switch {
+		case okPunch && stPunch.Active && (!okDir || !stDir.Active || stPunch.RTT <= stDir.RTT):
+			r.current = PathPunch
+		default:
 			r.current = PathDirect
 		}
 		return
@@ -111,13 +121,26 @@ func (r *Router) evaluatePath() {
 			return
 		}
 
-		// Priority 2: Direct Hole-Punched UDP
+		// Priority 2: direct-tier paths (Direct or Punch), pick the lower RTT.
 		stDirect, okDirect := r.stats[PathDirect]
+		stPunch, okPunch := r.stats[PathPunch]
 		stRelay, okRelay := r.stats[PathRelay]
 
+		var bestDirect PathType
+		var bestDirectRTT time.Duration
+		haveDirect := false
 		if okDirect && stDirect.Active && stDirect.LossRate < 0.15 {
-			if !okRelay || !stRelay.Active || stDirect.RTT <= stRelay.RTT+r.threshold {
-				r.current = PathDirect
+			bestDirect, bestDirectRTT, haveDirect = PathDirect, stDirect.RTT, true
+		}
+		if okPunch && stPunch.Active && stPunch.LossRate < 0.15 {
+			if !haveDirect || stPunch.RTT < bestDirectRTT {
+				bestDirect, bestDirectRTT, haveDirect = PathPunch, stPunch.RTT, true
+			}
+		}
+
+		if haveDirect {
+			if !okRelay || !stRelay.Active || bestDirectRTT <= stRelay.RTT+r.threshold {
+				r.current = bestDirect
 				return
 			}
 		}
@@ -141,8 +164,9 @@ func (r *Router) GetStatusString() string {
 
 	stLAN := r.stats[PathLAN]
 	stDirect := r.stats[PathDirect]
+	stPunch := r.stats[PathPunch]
 	stRelay := r.stats[PathRelay]
 
-	return fmt.Sprintf("ActivePath: [%s] | LAN: (Active=%v, RTT=%v) | Direct: (Active=%v, RTT=%v) | Relay: (Active=%v, RTT=%v)",
-		r.current, stLAN.Active, stLAN.RTT, stDirect.Active, stDirect.RTT, stRelay.Active, stRelay.RTT)
+	return fmt.Sprintf("ActivePath: [%s] | LAN: (Active=%v, RTT=%v) | Direct: (Active=%v, RTT=%v) | Punch: (Active=%v, RTT=%v) | Relay: (Active=%v, RTT=%v)",
+		r.current, stLAN.Active, stLAN.RTT, stDirect.Active, stDirect.RTT, stPunch.Active, stPunch.RTT, stRelay.Active, stRelay.RTT)
 }

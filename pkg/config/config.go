@@ -30,6 +30,7 @@ type ServerConfig struct {
 	Secret          string   `yaml:"secret"`            // Shared secret / token for authentication (optional)
 	PublicIPs       []string `yaml:"public_ips"`        // List of server public IPs/domains to announce
 	DirectPortRange string   `yaml:"direct_port_range"` // Direct STUN / hole-punch port range or explicit port
+	NAT             string   `yaml:"nat"`               // "auto" (default) | "true" | "false" — whether the server sits behind NAT (no public IP)
 }
 
 // DefaultClientConfig returns default client settings.
@@ -168,6 +169,7 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		Secret          string   `yaml:"secret"`
 		PublicIPs       []string `yaml:"public_ips"`
 		DirectPortRange string   `yaml:"direct_port_range"`
+		NAT             string   `yaml:"nat"`
 	}
 
 	var raw rawServerConfig
@@ -187,6 +189,7 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	cfg.Secret = raw.Secret
 	cfg.PublicIPs = raw.PublicIPs
 	cfg.DirectPortRange = raw.DirectPortRange
+	cfg.NAT = raw.NAT
 
 	log.Printf("[Config] Loaded server configuration from: %s", path)
 	return cfg, nil

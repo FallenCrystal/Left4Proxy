@@ -45,9 +45,11 @@ type Server struct {
 	udpConn           *net.UDPConn
 	sessions          map[uint64]*clientSession
 	pendingProxyAddrs map[string]*proxyAddrEntry // Map raw tunnel sender IP:Port -> real client UDPAddr
+	stunProbeLogged   map[string]bool            // Dedup so only the first STUN probe per sender is logged.
 	proxyAddrMu       sync.RWMutex
 	sessionMu         sync.RWMutex
 	nextID            uint64
+	behindNAT         bool // Whether the server has no public interface IP (for direct vs punch labeling).
 	ctx               context.Context
 	cancel            context.CancelFunc
 	wg                sync.WaitGroup
@@ -60,13 +62,15 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 		cfg:               cfg,
 		sessions:          make(map[uint64]*clientSession),
 		pendingProxyAddrs: make(map[string]*proxyAddrEntry),
+		stunProbeLogged:   make(map[string]bool),
 		// Seed the session ID counter randomly. After a server restart the counter
 		// must NOT restart from 0, otherwise a freshly-connected client could be
 		// assigned an ID that a client from before the restart is still using, and
 		// the two sessions would collide on the server.
-		nextID: rand.Uint64(),
-		ctx:    ctx,
-		cancel: cancel,
+		nextID:     rand.Uint64(),
+		behindNAT:  determineBehindNAT(cfg.NAT),
+		ctx:        ctx,
+		cancel:     cancel,
 	}, nil
 }
 
@@ -150,11 +154,16 @@ func (s *Server) readUDPDataLoop() {
 				realClientAddr = extractedAddr
 				packetData = packetData[offset:]
 			} else {
-				s.proxyAddrMu.RLock()
+				// Headerless packet from a known tunnel: reuse the cached real
+				// address AND refresh its timestamp, otherwise the entry gets pruned
+				// after 60s of an active tunnel and the real client IP is lost
+				// (reflections would then show the frpc socket address instead).
+				s.proxyAddrMu.Lock()
 				if pending, ok := s.pendingProxyAddrs[rawSenderAddr.String()]; ok {
 					realClientAddr = pending.addr
+					pending.ts = time.Now()
 				}
-				s.proxyAddrMu.RUnlock()
+				s.proxyAddrMu.Unlock()
 			}
 		}
 
@@ -171,6 +180,78 @@ func (s *Server) readUDPDataLoop() {
 	}
 }
 
+// determineBehindNAT decides whether the server is behind NAT (no public IP
+// directly on the box). It honors an explicit `nat` config value and falls back
+// to inspecting the host's interface addresses.
+func determineBehindNAT(conf string) bool {
+	switch strings.ToLower(strings.TrimSpace(conf)) {
+	case "true", "yes", "1", "on":
+		return true
+	case "false", "no", "0", "off":
+		return false
+	}
+	return !hasPublicInterfaceIP()
+}
+
+// hasPublicInterfaceIP reports whether any interface has a global unicast,
+// non-private IP address (i.e. the server itself is directly reachable publicly).
+func hasPublicInterfaceIP() bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil {
+				continue
+			}
+			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				continue
+			}
+			if ip.IsGlobalUnicast() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// classifyPath labels how a client connection reached the server:
+//
+//	relay  — via a PROXY-protocol tunnel (frp/HAProxy)
+//	lan    — client source is private/loopback (same LAN)
+//	punch  — direct arrival from a public client, but the server is behind NAT
+//	         (client got in via a NAT mapping / hole punch / port-forward)
+//	direct — direct arrival from a public client to a public (non-NAT) server
+func (s *Server) classifyPath(rawSenderAddr, realClientAddr *net.UDPAddr) string {
+	if s.cfg.ProxyProtocolV2 {
+		s.proxyAddrMu.RLock()
+		_, tunneled := s.pendingProxyAddrs[rawSenderAddr.String()]
+		s.proxyAddrMu.RUnlock()
+		if tunneled {
+			return "relay"
+		}
+	}
+	if realClientAddr != nil && (realClientAddr.IP.IsPrivate() || realClientAddr.IP.IsLoopback()) {
+		return "lan"
+	}
+	if s.behindNAT {
+		return "punch"
+	}
+	return "direct"
+}
+
 // handlePacket processes unmarshaled protocol packets.
 func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAddr *net.UDPAddr) {
 	switch pkt.Cmd {
@@ -179,11 +260,14 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		_ = s.getOrCreateSession(sid, rawSenderAddr, realClientAddr)
 
 		reflected := stun.ReflectAddress(realClientAddr)
+		// Tell the client how this connection reached us (relay/direct/punch/lan)
+		// so it can label the candidate honestly instead of guessing.
+		pathHint := s.classifyPath(rawSenderAddr, realClientAddr)
 		var respPayload string
 		if len(s.cfg.PublicIPs) > 0 {
-			respPayload = fmt.Sprintf("%s|%s", reflected, strings.Join(s.cfg.PublicIPs, ","))
+			respPayload = fmt.Sprintf("%s|%s|%s", reflected, strings.Join(s.cfg.PublicIPs, ","), pathHint)
 		} else {
-			respPayload = reflected
+			respPayload = fmt.Sprintf("%s||%s", reflected, pathHint)
 		}
 
 		// Echo back client's sent timestamp for instant RTT calculation during handshake
@@ -199,8 +283,8 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		// Send UDP response back to rawSenderAddr (the frp tunnel return socket!)
 		_, _ = s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
 
-		log.Printf("[Server] Client Handshake accepted (SessionID: %d, Real Client Endpoint: %s, Socket Sender: %s)",
-			sid, realClientAddr.String(), rawSenderAddr.String())
+		log.Printf("[Server] Client Handshake accepted (SessionID: %d, Real Client Endpoint: %s, Socket Sender: %s, Path: %s)",
+			sid, realClientAddr.String(), rawSenderAddr.String(), pathHint)
 
 	case protocol.CmdLanProbe:
 		respPkt := protocol.NewPacket(protocol.CmdLanAck, pkt.SessionID, pkt.Seq, []byte("LAN_ACK"))
@@ -209,7 +293,20 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 	case protocol.CmdStunProbe:
 		respPayload := []byte(stun.ReflectAddress(realClientAddr))
 		respPkt := protocol.NewPacket(protocol.CmdStunAck, pkt.SessionID, pkt.Seq, respPayload)
-		_, _ = s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
+		_, wErr := s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
+
+		// Log only the first probe per tunnel sender so STUN keepalives don't
+		// spam the server log every few seconds.
+		key := rawSenderAddr.String()
+		s.proxyAddrMu.Lock()
+		first := !s.stunProbeLogged[key]
+		if first {
+			s.stunProbeLogged[key] = true
+		}
+		s.proxyAddrMu.Unlock()
+		if first {
+			log.Printf("[Server] STUN probe from %s (real %s, sid=%d) -> ack sent, wErr=%v", rawSenderAddr, realClientAddr, pkt.SessionID, wErr)
+		}
 
 	case protocol.CmdPing:
 		// Keep idle-but-alive sessions (and their stable upstream socket) from being

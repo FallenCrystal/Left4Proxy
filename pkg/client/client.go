@@ -17,14 +17,16 @@ import (
 )
 
 type serverCandidate struct {
-	mu         sync.RWMutex
-	addrStr    string
-	udpAddr    *net.UDPAddr
-	conn       *net.UDPConn
-	lastActive time.Time
-	rtt        time.Duration
-	isLAN      bool
-	online     bool
+	mu            sync.RWMutex
+	addrStr       string
+	udpAddr       *net.UDPAddr
+	conn          *net.UDPConn
+	lastActive    time.Time
+	rtt           time.Duration
+	isLAN         bool
+	online        bool
+	lastReflected string // Last STUN-reflected public endpoint, for deduped logging.
+	pathHint      string // Server's classification: "relay" | "direct" | "punch" | "lan".
 }
 
 // Client is the Left4Proxy client daemon.
@@ -100,8 +102,15 @@ func (s *Client) Start() error {
 
 	// 4. Start Hole Puncher & Background Loops
 	if s.cfg.EnablePunch && s.bestCandidate != nil {
-		s.holePuncher = stun.NewHolePuncher(s.sessionID.Load(), s.bestCandidate.conn, s.bestCandidate.udpAddr)
-		s.holePuncher.StartPunching(3 * time.Second)
+		interval := time.Duration(s.cfg.PingInterval) * time.Second
+		if interval <= 0 {
+			interval = 3 * time.Second
+		}
+		s.holePuncher = stun.NewHolePuncher(s.sessionID.Load(), s.bestCandidate.conn)
+		s.holePuncher.StartPunching(interval)
+		log.Printf("[Client] STUN hole-punching enabled -> candidate [%s] (interval %v)", s.bestCandidate.addrStr, interval)
+	} else {
+		log.Printf("[Client] STUN hole-punching disabled (enable_punch=%v)", s.cfg.EnablePunch)
 	}
 
 	s.wg.Add(2)
@@ -162,6 +171,33 @@ func (s *Client) sendHandshake(cand *serverCandidate) {
 	_, _ = cand.conn.Write(handshakePkt.Marshal())
 }
 
+// pathForCandidate maps a candidate to the path type its traffic actually takes.
+// LAN candidates are a direct same-subnet path. Non-LAN candidates are labeled
+// by the server's handshake hint: reached through a tunnel -> Relay, via a NAT
+// mapping on a NATed server -> Punch, otherwise a direct connection to a public
+// server -> Direct. Unknown hints (old server) default to Relay, the historical
+// safe assumption for a non-LAN candidate.
+func (s *Client) pathForCandidate(cand *serverCandidate) router.PathType {
+	cand.mu.RLock()
+	isLAN := cand.isLAN
+	hint := cand.pathHint
+	cand.mu.RUnlock()
+
+	if isLAN {
+		return router.PathLAN
+	}
+	switch hint {
+	case "relay":
+		return router.PathRelay
+	case "punch":
+		return router.PathPunch
+	case "direct":
+		return router.PathDirect
+	default:
+		return router.PathRelay
+	}
+}
+
 // selectBestCandidate evaluates all candidate endpoints with switching hysteresis.
 func (s *Client) selectBestCandidate() {
 	s.candidateMu.Lock()
@@ -178,6 +214,7 @@ func (s *Client) selectBestCandidate() {
 		online := cand.online
 		rtt := cand.rtt
 		isLAN := cand.isLAN
+		pathHint := cand.pathHint
 		cand.mu.RUnlock()
 
 		// Apply the routing mode and LAN preference from the config, otherwise the
@@ -187,7 +224,12 @@ func (s *Client) selectBestCandidate() {
 				continue
 			}
 		} else if s.cfg.Mode == "direct-only" {
-			continue
+			// direct-only means "no tunnel": exclude relay candidates, but keep
+			// direct/punch ones. Unknown (handshake not yet completed) is treated
+			// as relay, so a fresh candidate is only admitted once classified.
+			if pathHint == "relay" || pathHint == "" {
+				continue
+			}
 		}
 
 		if online && !lastActive.IsZero() && now.Sub(lastActive) <= 15*time.Second {
@@ -234,6 +276,13 @@ func (s *Client) selectBestCandidate() {
 		bestRTT := best.rtt
 		bestLAN := best.isLAN
 		best.mu.RUnlock()
+
+		// Keep the hole puncher following the active candidate, so STUN keepalives
+		// keep the NAT mapping of the path that actually carries data alive.
+		if s.cfg.EnablePunch && s.holePuncher != nil {
+			s.holePuncher.Retarget(best.conn)
+			log.Printf("[Client] STUN hole-puncher retargeted -> candidate [%s]", best.addrStr)
+		}
 
 		log.Printf("[Client] Optimal Route Switch -> Active Candidate: [%s] (IP: %s, RTT: %v, LAN: %v)",
 			best.addrStr, best.udpAddr.String(), bestRTT, bestLAN)
@@ -360,24 +409,24 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 
 		cand.mu.RLock()
 		candRTT := cand.rtt
-		isLAN := cand.isLAN
 		cand.mu.RUnlock()
 
 		payloadStr := string(pkt.Payload)
 		parts := strings.Split(payloadStr, "|")
 		reflected := parts[0]
 
+		// Store the server's path classification so pathForCandidate can label
+		// this candidate Direct/Punch/Relay instead of guessing.
+		if len(parts) > 2 {
+			cand.mu.Lock()
+			cand.pathHint = parts[2]
+			cand.mu.Unlock()
+		}
+
 		log.Printf("[Client] Connected & Handshake Verified -> Candidate [%s] (IP: %s, RTT: %v) | SessionID: %d | Apparent Endpoint: %s",
 			cand.addrStr, cand.udpAddr.String(), candRTT, pkt.SessionID, reflected)
 
-		if isLAN {
-			s.router.UpdateMetrics(router.PathLAN, candRTT, 0.0)
-		} else if s.cfg.Mode == "relay-only" {
-			// In relay-only mode a non-LAN candidate is the relay path.
-			s.router.UpdateMetrics(router.PathRelay, candRTT, 0.0)
-		} else {
-			s.router.UpdateMetrics(router.PathDirect, candRTT, 0.0)
-		}
+		s.router.UpdateMetrics(s.pathForCandidate(cand), candRTT, 0.0)
 
 		// Process server's advertised public_ips / LAN IPs
 		if len(parts) > 1 && parts[1] != "" {
@@ -396,18 +445,10 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 
 	case protocol.CmdPong:
 		cand.mu.RLock()
-		isLAN := cand.isLAN
 		candRTT := cand.rtt
 		cand.mu.RUnlock()
 
-		if isLAN {
-			s.router.UpdateMetrics(router.PathLAN, candRTT, 0.0)
-		} else if s.cfg.Mode == "relay-only" {
-			// In relay-only mode a non-LAN candidate is the relay path.
-			s.router.UpdateMetrics(router.PathRelay, candRTT, 0.0)
-		} else {
-			s.router.UpdateMetrics(router.PathDirect, candRTT, 0.0)
-		}
+		s.router.UpdateMetrics(s.pathForCandidate(cand), candRTT, 0.0)
 		s.selectBestCandidate()
 
 	case protocol.CmdLanAck:
@@ -419,7 +460,27 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		s.selectBestCandidate()
 
 	case protocol.CmdStunAck:
-		s.router.UpdateMetrics(router.PathDirect, 20*time.Millisecond, 0.0)
+		// A STUN ack is the server reflecting a probe back on the candidate's own
+		// socket (NAT keepalive/reflection) — it is not a separate direct data
+		// path, so record it under the path the candidate actually carries. Feeding
+		// it as PathDirect would mislabel a relayed connection as "direct".
+		reflected := string(pkt.Payload)
+		firstReflection := false
+		cand.mu.Lock()
+		if reflected != "" && reflected != cand.lastReflected {
+			cand.lastReflected = reflected
+			firstReflection = true
+		}
+		cand.mu.Unlock()
+		if firstReflection {
+			log.Printf("[Client] STUN reflection OK -> public endpoint [%s] via candidate [%s]", reflected, cand.addrStr)
+		}
+		cand.mu.RLock()
+		stunRTT := cand.rtt
+		cand.mu.RUnlock()
+		if stunRTT > 0 {
+			s.router.UpdateMetrics(s.pathForCandidate(cand), stunRTT, 0.0)
+		}
 		s.selectBestCandidate()
 
 	case protocol.CmdData:
@@ -479,7 +540,7 @@ func (s *Client) pingProbeLoop() {
 
 			if !anyOnline {
 				s.router.SetInactive(router.PathLAN)
-				s.router.SetInactive(router.PathDirect)
+				s.router.SetInactive(router.PathRelay)
 
 				if s.lastReportedCand != "OFFLINE" {
 					s.lastReportedCand = "OFFLINE"
