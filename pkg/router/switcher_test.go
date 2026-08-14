@@ -88,3 +88,18 @@ func TestRouterModes(t *testing.T) {
 		t.Errorf("expected direct-only mode to select Direct, got %s", rDirect.CurrentPath())
 	}
 }
+
+func TestRouterLossPenalty(t *testing.T) {
+	r := NewRouter("auto")
+
+	// Direct has slightly lower RTT (35ms) but high loss rate (25%) -> Score becomes 35 * (1 + 0.25*4) = 70ms
+	// Relay has 45ms RTT with 0% loss -> Score = 45ms.
+	// Relay should be preferred over lossy Direct!
+	r.UpdateMetrics(PathRelay, 45*time.Millisecond, 0.0)
+	r.UpdateMetrics(PathDirect, 35*time.Millisecond, 0.25)
+
+	if r.CurrentPath() != PathRelay {
+		t.Errorf("expected Relay to win over lossy Direct (loss 25%%), got %s", r.CurrentPath())
+	}
+}
+

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net"
+	"strings"
 )
 
 // STUN (RFC 5389) message constants used by the hole-punching path. The server
@@ -21,6 +22,52 @@ const (
 
 	stunHeaderLen = 20
 )
+
+// DefaultStunServers provides a robust list of reliable public STUN servers for fallback and racing.
+var DefaultStunServers = []string{
+	"stun.cloudflare.com:3478",
+	"stun.l.google.com:19302",
+	"stun1.l.google.com:19302",
+	"stun.syncthing.net:3478",
+	"stun.miwifi.com:3478",
+}
+
+// ResolveStunServers resolves a slice of "host:port" STUN server strings into UDP addresses,
+// skipping unresolvable ones.
+func ResolveStunServers(servers []string) []*net.UDPAddr {
+	var addrs []*net.UDPAddr
+	seen := make(map[string]bool)
+	for _, s := range servers {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		addr, err := net.ResolveUDPAddr("udp", s)
+		if err == nil && addr != nil {
+			k := addr.String()
+			if !seen[k] {
+				seen[k] = true
+				addrs = append(addrs, addr)
+			}
+		}
+	}
+	return addrs
+}
+
+// SendMultiBindingRequests transmits STUN Binding Requests to multiple STUN server addresses in parallel
+// from the provided UDP socket to race them for the fastest reflection.
+func SendMultiBindingRequests(conn *net.UDPConn, addrs []*net.UDPAddr) {
+	if conn == nil || len(addrs) == 0 {
+		return
+	}
+	req := BuildBindingRequest()
+	for _, addr := range addrs {
+		if addr != nil {
+			_, _ = conn.WriteToUDP(req, addr)
+		}
+	}
+}
+
 
 // BuildBindingRequest builds a 20-byte STUN Binding Request with a random
 // transaction ID. It carries no attributes.

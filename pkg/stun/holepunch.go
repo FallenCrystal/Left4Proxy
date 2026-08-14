@@ -43,26 +43,53 @@ func NewHolePuncher(sessionID uint64, conn *net.UDPConn, sendTo *net.UDPAddr) *H
 	}
 }
 
+// SendBurst sends an immediate burst of N probes spaced by interval.
+func (hp *HolePuncher) SendBurst(count int, interval time.Duration) {
+	for i := 0; i < count; i++ {
+		_ = hp.SendProbe()
+		if i+1 < count && interval > 0 {
+			time.Sleep(interval)
+		}
+	}
+}
+
 // StartPunching sends periodic UDP hole-punching probes to establish and maintain NAT mapping.
+// It begins with an immediate fast burst (5 probes at 25ms intervals) to punch through the
+// NAT state table within ~100ms, then transitions to periodic keepalives.
 func (hp *HolePuncher) StartPunching(interval time.Duration) {
-	ticker := time.NewTicker(interval)
 	go func() {
+		// Fast burst to open hole immediately
+		hp.SendBurst(5, 25*time.Millisecond)
+
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-hp.stopCh:
 				return
 			case <-ticker.C:
-				hp.SendProbe()
+				_ = hp.SendProbe()
 			}
 		}
 	}()
-	// Immediately send initial burst of probes
-	for i := 0; i < 3; i++ {
-		hp.SendProbe()
-		time.Sleep(20 * time.Millisecond)
+}
+
+// SendBurstProbes is a standalone helper that sends a burst of CmdStunProbe packets
+// to a specific target address. Useful for immediate punch reactions on server and client.
+func SendBurstProbes(conn *net.UDPConn, target *net.UDPAddr, sessionID uint64, count int, interval time.Duration) {
+	if conn == nil || target == nil || count <= 0 {
+		return
+	}
+	pkt := protocol.NewPacket(protocol.CmdStunProbe, sessionID, 0, []byte("PUNCH"))
+	data := pkt.Marshal()
+	for i := 0; i < count; i++ {
+		_, _ = conn.WriteToUDP(data, target)
+		if i+1 < count && interval > 0 {
+			time.Sleep(interval)
+		}
 	}
 }
+
 
 // SendProbe transmits a single UDP STUN probe packet.
 //

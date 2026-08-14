@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"left4proxy/pkg/config"
+	"left4proxy/pkg/discover"
 	"left4proxy/pkg/protocol"
 	"left4proxy/pkg/proxyproto"
 	"left4proxy/pkg/stun"
@@ -50,9 +51,10 @@ type Server struct {
 	stunProbeLogged   map[string]bool            // Dedup so only the first STUN probe per sender is logged.
 	proxyAddrMu       sync.RWMutex
 	sessionMu         sync.RWMutex
-	serverPubMu       sync.RWMutex // Guards serverPublic.
+	serverPubMu       sync.RWMutex // Guards serverPublic and upnpCleanup.
 	serverPublic      *net.UDPAddr // The server's NAT-mapped public endpoint (advertised so clients can punch to it).
-	stunAddr          *net.UDPAddr // Resolved public STUN server. Written only by discoverPublicEndpointLoop.
+	upnpCleanup       func()       // Optional UPnP port mapping release callback.
+	stunAddrs         []*net.UDPAddr // Resolved public STUN servers for multi-STUN racing.
 	nextID            uint64
 	behindNAT         bool // Whether the server has no public interface IP (for direct vs punch labeling).
 	ctx               context.Context
@@ -94,6 +96,21 @@ func (s *Server) Start() error {
 
 	log.Printf("[Server] Left4Proxy Server listening on UDP %s | Target L4D2: %s | PROXY Protocol Parser: %v",
 		s.cfg.ListenAddr, s.cfg.TargetAddr, s.cfg.ProxyProtocolV2)
+
+	// Attempt UPnP IGD automatic port mapping in background
+	go func() {
+		port := udpAddr.Port
+		if port > 0 {
+			extAddr, cleanup := discover.TryUPnPMapping(s.ctx, port, "Left4Proxy Server")
+			if extAddr != nil {
+				s.serverPubMu.Lock()
+				s.upnpCleanup = cleanup
+				s.serverPubMu.Unlock()
+				log.Printf("[Server] UPnP IGD port mapping succeeded -> %s", extAddr)
+				s.updateServerPublic(extAddr)
+			}
+		}
+	}()
 
 	s.wg.Add(3)
 	go s.readUDPDataLoop()
@@ -247,24 +264,28 @@ func (s *Server) broadcastPunchOffer() {
 	}
 }
 
-// sendStunBindingRequest sends a STUN Binding Request from the main listener
-// socket so the NAT reveals the server's public endpoint.
+// sendStunBindingRequest sends STUN Binding Requests to resolved STUN servers in parallel
+// from the main listener socket so the NAT reveals the server's public endpoint.
 func (s *Server) sendStunBindingRequest() {
-	if s.stunAddr == nil {
-		addr, err := net.ResolveUDPAddr("udp", s.cfg.StunServer)
-		if err != nil {
-			log.Printf("[Server] Bad stun_server %q: %v", s.cfg.StunServer, err)
+	if len(s.stunAddrs) == 0 {
+		candidates := []string{}
+		if s.cfg.StunServer != "" {
+			candidates = append(candidates, s.cfg.StunServer)
+		}
+		candidates = append(candidates, stun.DefaultStunServers...)
+		s.stunAddrs = stun.ResolveStunServers(candidates)
+		if len(s.stunAddrs) == 0 {
+			log.Printf("[Server] Failed to resolve any public STUN servers (configured: %q)", s.cfg.StunServer)
 			return
 		}
-		s.stunAddr = addr
 	}
-	_, _ = s.udpConn.WriteToUDP(stun.BuildBindingRequest(), s.stunAddr)
+	stun.SendMultiBindingRequests(s.udpConn, s.stunAddrs)
 }
 
 // discoverPublicEndpointLoop determines the server's public punch endpoint. If
 // punch_addr is configured it is used directly (manual override). Otherwise the
-// server periodically sends a STUN Binding Request and records the reflected
-// endpoint when the response arrives in readUDPDataLoop.
+// server periodically sends STUN Binding Requests to multiple STUN servers and
+// records the reflected endpoint when the response arrives in readUDPDataLoop.
 func (s *Server) discoverPublicEndpointLoop() {
 	defer s.wg.Done()
 
@@ -279,14 +300,20 @@ func (s *Server) discoverPublicEndpointLoop() {
 		return
 	}
 
+	// Initial immediate STUN burst
+	for i := 0; i < 2; i++ {
+		s.sendStunBindingRequest()
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for {
-		s.sendStunBindingRequest()
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			s.sendStunBindingRequest()
 		}
 	}
 }
@@ -316,6 +343,16 @@ func (s *Server) punchProbeLoop(sess *clientSession, target *net.UDPAddr) {
 		}
 		_, _ = s.udpConn.WriteToUDP(data, target)
 	}
+}
+
+// isWildcardListenAddr reports whether a listen address binds to all network interfaces.
+func isWildcardListenAddr(listenAddr string) bool {
+	host, _, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		host = listenAddr
+	}
+	host = strings.TrimSpace(host)
+	return host == "" || host == "0.0.0.0" || host == "::" || host == "[::]"
 }
 
 // determineBehindNAT decides whether the server is behind NAT (no public IP
@@ -401,9 +438,37 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		// Tell the client how this connection reached us (relay/direct/punch/lan)
 		// so it can label the candidate honestly instead of guessing.
 		pathHint := s.classifyPath(rawSenderAddr, realClientAddr)
+
+		// Collect configured public IPs as well as auto-discovered LAN and IPv6 host candidates (if listening on wildcard)
+		listenPort := 27014
+		if s.udpConn != nil {
+			if lAddr, ok := s.udpConn.LocalAddr().(*net.UDPAddr); ok && lAddr.Port > 0 {
+				listenPort = lAddr.Port
+			}
+		}
+		var localCandidates []string
+		if isWildcardListenAddr(s.cfg.ListenAddr) {
+			localCandidates = discover.GatherAllLocalCandidates(listenPort)
+		}
+		var combinedIPs []string
+		seenAddrs := make(map[string]bool)
+		for _, a := range s.cfg.PublicIPs {
+			a = strings.TrimSpace(a)
+			if a != "" && !seenAddrs[a] {
+				seenAddrs[a] = true
+				combinedIPs = append(combinedIPs, a)
+			}
+		}
+		for _, a := range localCandidates {
+			if !seenAddrs[a] {
+				seenAddrs[a] = true
+				combinedIPs = append(combinedIPs, a)
+			}
+		}
+
 		var respPayload string
-		if len(s.cfg.PublicIPs) > 0 {
-			respPayload = fmt.Sprintf("%s|%s|%s", reflected, strings.Join(s.cfg.PublicIPs, ","), pathHint)
+		if len(combinedIPs) > 0 {
+			respPayload = fmt.Sprintf("%s|%s|%s", reflected, strings.Join(combinedIPs, ","), pathHint)
 		} else {
 			respPayload = fmt.Sprintf("%s||%s", reflected, pathHint)
 		}
@@ -479,6 +544,10 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		ack := protocol.NewPacket(protocol.CmdPunchAck, pkt.SessionID, pkt.Seq, []byte("PUNCH_INIT_OK"))
 		_, _ = s.udpConn.WriteToUDP(ack.Marshal(), rawSenderAddr)
 		log.Printf("[Server] PunchInit (sid=%d) target %s via sender %s", pkt.SessionID, target, rawSenderAddr)
+
+		// Immediately fire a fast burst of 5 probes to establish server-side NAT mapping with minimal latency
+		go stun.SendBurstProbes(s.udpConn, target, pkt.SessionID, 5, 25*time.Millisecond)
+
 		s.wg.Add(1)
 		go s.punchProbeLoop(sess, target)
 
@@ -719,6 +788,13 @@ func (s *Server) Stop() {
 	if s.udpConn != nil {
 		_ = s.udpConn.Close()
 	}
+
+	s.serverPubMu.Lock()
+	if s.upnpCleanup != nil {
+		s.upnpCleanup()
+		s.upnpCleanup = nil
+	}
+	s.serverPubMu.Unlock()
 
 	s.sessionMu.Lock()
 	for _, sess := range s.sessions {

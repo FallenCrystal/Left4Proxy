@@ -50,7 +50,17 @@ func NewRouter(mode string) *Router {
 	return r
 }
 
-// UpdateMetrics updates RTT and loss rate for a specific path.
+// Score returns the quality-weighted effective latency. Higher loss rate significantly penalizes the path.
+func (st *PathStats) Score() time.Duration {
+	if st == nil || !st.Active {
+		return 999 * time.Second
+	}
+	// Formula: Score = RTT * (1 + LossRate * 4.0)
+	score := float64(st.RTT) * (1.0 + st.LossRate*4.0)
+	return time.Duration(score)
+}
+
+// UpdateMetrics updates RTT and loss rate for a specific path using EWMA smoothing.
 func (r *Router) UpdateMetrics(pt PathType, rtt time.Duration, loss float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -60,8 +70,14 @@ func (r *Router) UpdateMetrics(pt PathType, rtt time.Duration, loss float64) {
 		st = &PathStats{}
 		r.stats[pt] = st
 	}
-	st.RTT = rtt
-	st.LossRate = loss
+	if !st.Active || st.RTT >= 900*time.Millisecond {
+		st.RTT = rtt
+		st.LossRate = loss
+	} else {
+		// EWMA smoothing
+		st.RTT = time.Duration(float64(st.RTT)*0.75 + float64(rtt)*0.25)
+		st.LossRate = st.LossRate*0.75 + loss*0.25
+	}
 	st.LastActive = time.Now()
 	st.Active = true
 
@@ -97,11 +113,11 @@ func (r *Router) evaluatePath() {
 			r.current = PathLAN
 			return
 		}
-		// Direct-tier paths (Direct or Punch) — pick the lower RTT.
+		// Direct-tier paths (Direct or Punch) — pick the lower Score.
 		stDir, okDir := r.stats[PathDirect]
 		stPunch, okPunch := r.stats[PathPunch]
 		switch {
-		case okPunch && stPunch.Active && (!okDir || !stDir.Active || stPunch.RTT <= stDir.RTT):
+		case okPunch && stPunch.Active && (!okDir || !stDir.Active || stPunch.Score() <= stDir.Score()):
 			r.current = PathPunch
 		default:
 			r.current = PathDirect
@@ -121,25 +137,30 @@ func (r *Router) evaluatePath() {
 			return
 		}
 
-		// Priority 2: direct-tier paths (Direct or Punch), pick the lower RTT.
+		// Priority 2: direct-tier paths (Direct or Punch), pick the lower Score.
 		stDirect, okDirect := r.stats[PathDirect]
 		stPunch, okPunch := r.stats[PathPunch]
 		stRelay, okRelay := r.stats[PathRelay]
 
 		var bestDirect PathType
-		var bestDirectRTT time.Duration
+		var bestDirectScore time.Duration
 		haveDirect := false
-		if okDirect && stDirect.Active && stDirect.LossRate < 0.15 {
-			bestDirect, bestDirectRTT, haveDirect = PathDirect, stDirect.RTT, true
+		if okDirect && stDirect.Active && stDirect.LossRate < 0.20 {
+			bestDirect, bestDirectScore, haveDirect = PathDirect, stDirect.Score(), true
 		}
-		if okPunch && stPunch.Active && stPunch.LossRate < 0.15 {
-			if !haveDirect || stPunch.RTT < bestDirectRTT {
-				bestDirect, bestDirectRTT, haveDirect = PathPunch, stPunch.RTT, true
+		if okPunch && stPunch.Active && stPunch.LossRate < 0.20 {
+			punchScore := stPunch.Score()
+			if !haveDirect || punchScore < bestDirectScore {
+				bestDirect, bestDirectScore, haveDirect = PathPunch, punchScore, true
 			}
 		}
 
 		if haveDirect {
-			if !okRelay || !stRelay.Active || bestDirectRTT <= stRelay.RTT+r.threshold {
+			relayScore := 999 * time.Second
+			if okRelay && stRelay.Active {
+				relayScore = stRelay.Score()
+			}
+			if !okRelay || !stRelay.Active || bestDirectScore <= relayScore+r.threshold {
 				r.current = bestDirect
 				return
 			}

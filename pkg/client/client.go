@@ -66,6 +66,8 @@ type Client struct {
 	localConn        *net.UDPConn
 	candidates       []*serverCandidate
 	bestCandidate    *serverCandidate
+	prevCandidate    *serverCandidate // Previous candidate for temporary dual-sending during route transition.
+	dualSendUntil    time.Time        // End timestamp for dual-sending window.
 	candidateMu      sync.RWMutex
 	lastClientAddr   atomic.Pointer[net.UDPAddr] // Game netchannel socket (set by localReadLoop, read by handleServerPacket).
 	a2sQueryAddr     atomic.Pointer[net.UDPAddr] // Server-browser A2S query socket (separate from the game netchannel socket).
@@ -361,15 +363,21 @@ func (s *Client) waitPublicEndpoint(cand *serverCandidate, timeout time.Duration
 }
 
 // establishPunch drives the hole-punch exchange for a punch candidate: learn our
-// public endpoint on this socket via STUN, tell the server so it opens a hole
+// public endpoint on this socket via multi-STUN racing, tell the server so it opens a hole
 // toward us, then probe the server's public endpoint until a direct path is
 // confirmed or we give up and keep the relay.
 func (s *Client) establishPunch(cand *serverCandidate) {
 	defer s.wg.Done()
 
-	stunAddr, err := net.ResolveUDPAddr("udp", s.cfg.StunServer)
-	if err != nil {
-		log.Printf("[Client] Bad stun_server %q: %v", s.cfg.StunServer, err)
+	// Multi-STUN server resolution for racing & redundancy
+	stunCandidates := []string{}
+	if s.cfg.StunServer != "" {
+		stunCandidates = append(stunCandidates, s.cfg.StunServer)
+	}
+	stunCandidates = append(stunCandidates, stun.DefaultStunServers...)
+	stunAddrs := stun.ResolveStunServers(stunCandidates)
+	if len(stunAddrs) == 0 {
+		log.Printf("[Client] Bad stun_server %q and fallback servers unreachable", s.cfg.StunServer)
 		s.punchFailed(cand)
 		return
 	}
@@ -384,27 +392,28 @@ func (s *Client) establishPunch(cand *serverCandidate) {
 		}
 	}
 
-	// 1. Discover C_direct on the punch socket via the public STUN server.
-	binding := stun.BuildBindingRequest()
-	for i := 0; i < 3; i++ {
-		_, _ = cand.conn.WriteToUDP(binding, stunAddr)
+	// 1. Discover C_direct on the punch socket via parallel multi-STUN racing.
+	for i := 0; i < 2; i++ {
+		stun.SendMultiBindingRequests(cand.conn, stunAddrs)
 		time.Sleep(20 * time.Millisecond)
 	}
-	cDirect := s.waitPublicEndpoint(cand, 3*time.Second)
+	cDirect := s.waitPublicEndpoint(cand, 2*time.Second)
 	initSent := false
 	if cDirect != "" {
 		s.sendPunchInit(cand, cDirect)
 		initSent = true
 	}
 
-	// 2. Probe the server's public endpoint until confirmed or timed out. The
-	// server's replies (CmdStunAck) and any server-initiated probes mark the
-	// candidate online in candidateReadLoop, which confirms the direct path.
-	probePkt := protocol.NewPacket(protocol.CmdStunProbe, s.sessionID.Load(), 0, []byte("PUNCH"))
-	probeData := probePkt.Marshal()
+	// 2. Probe the server's public endpoint until confirmed or timed out.
 	cand.mu.RLock()
 	sendTo := cand.sendTo
 	cand.mu.RUnlock()
+
+	// Immediately send an initial burst of 5 probes to establish client NAT mapping within ~100ms
+	go stun.SendBurstProbes(cand.conn, sendTo, s.sessionID.Load(), 5, 25*time.Millisecond)
+
+	probePkt := protocol.NewPacket(protocol.CmdStunProbe, s.sessionID.Load(), 0, []byte("PUNCH"))
+	probeData := probePkt.Marshal()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
@@ -613,7 +622,13 @@ func (s *Client) selectBestCandidate() {
 			}
 		}
 
+		oldBest := s.bestCandidate
 		s.bestCandidate = best
+		if oldBest != nil && oldBest.online && oldBest != best {
+			s.prevCandidate = oldBest
+			s.dualSendUntil = time.Now().Add(400 * time.Millisecond)
+		}
+
 		best.mu.RLock()
 		bestRTT := best.rtt
 		bestLAN := best.isLAN
@@ -685,13 +700,20 @@ func (s *Client) localReadLoop() {
 
 		seq := atomic.AddUint32(&s.seq, 1)
 		pkt := protocol.NewPacket(protocol.CmdData, s.sessionID.Load(), seq, payload)
+		marshaled := pkt.Marshal()
 
 		s.candidateMu.RLock()
 		activeCand := s.bestCandidate
+		prevCand := s.prevCandidate
+		dualUntil := s.dualSendUntil
 		s.candidateMu.RUnlock()
 
 		if activeCand != nil {
-			_ = activeCand.send(pkt.Marshal())
+			_ = activeCand.send(marshaled)
+			// 0-RTT dual-sending: during route migration, send to both paths to prevent single packet drops
+			if prevCand != nil && prevCand != activeCand && time.Now().Before(dualUntil) {
+				_ = prevCand.send(marshaled)
+			}
 		}
 	}
 }
@@ -982,13 +1004,24 @@ func (s *Client) pingProbeLoop() {
 				lastActive := cand.lastActive
 				cand.mu.RUnlock()
 
-				if !lastActive.IsZero() && now.Sub(lastActive) <= 15*time.Second {
+				gameActive := s.gameConnAddr.Load() != nil
+				// Normal timeout is 15s. However, during active gameplay on a punched path,
+				// if no packet is received for > 2.5s, trigger fast failover to Relay to prevent game disconnect.
+				maxStale := 15 * time.Second
+				if gameActive && isPunch {
+					maxStale = 2500 * time.Millisecond
+				}
+
+				if !lastActive.IsZero() && now.Sub(lastActive) <= maxStale {
 					cand.mu.Lock()
 					cand.online = true
 					cand.mu.Unlock()
 					anyOnline = true
 					_ = cand.send(marshaledPing)
 				} else {
+					if gameActive && isPunch && cand.online {
+						log.Printf("[Client] Fast failover: Punch candidate [%s] unresponsive (>2.5s) during active game -> fallback to Relay", cand.addrStr)
+					}
 					cand.mu.Lock()
 					cand.online = false
 					canRehandshake := time.Since(cand.lastHandshake) >= 10*time.Second
