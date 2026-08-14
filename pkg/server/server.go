@@ -97,6 +97,13 @@ func (s *Server) Start() error {
 	log.Printf("[Server] Left4Proxy Server listening on UDP %s | Target L4D2: %s | PROXY Protocol Parser: %v",
 		s.cfg.ListenAddr, s.cfg.TargetAddr, s.cfg.ProxyProtocolV2)
 
+	if isWildcardListenAddr(s.cfg.ListenAddr) {
+		hostCands := discover.GatherAllLocalCandidates(udpAddr.Port)
+		if len(hostCands) > 0 {
+			log.Printf("[Server] Auto-discovered local host & IPv6 candidates: %v", hostCands)
+		}
+	}
+
 	// Attempt UPnP IGD automatic port mapping in background
 	go func() {
 		port := udpAddr.Port
@@ -108,6 +115,8 @@ func (s *Server) Start() error {
 				s.serverPubMu.Unlock()
 				log.Printf("[Server] UPnP IGD port mapping succeeded -> %s", extAddr)
 				s.updateServerPublic(extAddr)
+			} else {
+				log.Printf("[Server] UPnP IGD port mapping not available or disabled on router gateway")
 			}
 		}
 	}()
@@ -278,6 +287,7 @@ func (s *Server) sendStunBindingRequest() {
 			log.Printf("[Server] Failed to resolve any public STUN servers (configured: %q)", s.cfg.StunServer)
 			return
 		}
+		log.Printf("[Server] Resolved %d public STUN servers for endpoint discovery and racing", len(s.stunAddrs))
 	}
 	stun.SendMultiBindingRequests(s.udpConn, s.stunAddrs)
 }

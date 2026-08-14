@@ -381,6 +381,7 @@ func (s *Client) establishPunch(cand *serverCandidate) {
 		s.punchFailed(cand)
 		return
 	}
+	log.Printf("[Client] Initiating STUN hole punch -> racing %d public STUN servers for endpoint discovery", len(stunAddrs))
 
 	// PunchInit must carry a real session ID so the server maps it to our
 	// session; wait for the handshake to complete if needed.
@@ -627,6 +628,7 @@ func (s *Client) selectBestCandidate() {
 		if oldBest != nil && oldBest.online && oldBest != best {
 			s.prevCandidate = oldBest
 			s.dualSendUntil = time.Now().Add(400 * time.Millisecond)
+			log.Printf("[Client] Route migration: Dual-sending to [%s] and [%s] for 400ms (0-RTT handoff)", best.addrStr, oldBest.addrStr)
 		}
 
 		best.mu.RLock()
