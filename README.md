@@ -217,14 +217,31 @@ stun_server: "stun.cloudflare.com:3478"
 
 ### 编译指令
 
+使用项目内置的构建脚本（默认构建 Windows 与 Linux 的 amd64 版本）：
+
+```bash
+# 赋予执行权限并构建全部平台
+chmod +x build.sh
+./build.sh
+
+# 也支持指定子命令构建：
+# ./build.sh linux     # 仅构建 Linux (amd64) 版本
+# ./build.sh windows   # 仅构建 Windows (amd64) 版本
+# ./build.sh server    # 仅构建服务端 (Linux + Windows)
+# ./build.sh client    # 仅构建客户端 (Linux + Windows)
+# ./build.sh clean     # 清理 bin/ 目录
+```
+
+或者使用原生 Go 命令：
+
 ```bash
 # 编译 Linux 平台版本
-go build -o bin/left4proxy-server ./cmd/server
-go build -o bin/left4proxy-client ./cmd/client
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/left4proxy-server-linux-amd64 ./cmd/server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/left4proxy-client-linux-amd64 ./cmd/client
 
 # 交叉编译 Windows 平台版本
-GOOS=windows GOARCH=amd64 go build -o bin/left4proxy-server.exe ./cmd/server
-GOOS=windows GOARCH=amd64 go build -o bin/left4proxy-client.exe ./cmd/client
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/left4proxy-server-windows-amd64.exe ./cmd/server
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/left4proxy-client-windows-amd64.exe ./cmd/client
 ```
 
 ### 运行方式
@@ -236,6 +253,22 @@ GOOS=windows GOARCH=amd64 go build -o bin/left4proxy-client.exe ./cmd/client
 # 启动客户端
 ./bin/left4proxy-client -c config.client.yaml
 ```
+
+### 客户端交互命令 (Interactive CLI)
+
+客户端启动后会监听标准输入流，支持在终端输入以下命令查看状态与动态控制：
+
+| 命令 | 别名 | 功能说明 |
+| :--- | :--- | :--- |
+| `status` | `st`, `s`, `info` | 打印当前连接会话、本地监听、活跃路由模式、本地 NAT 映射类型、游戏连接状态及所有候选节点延迟与 NAT 信息 |
+| `ping` | `probe`, `p`, `refresh` | 主动向所有候选节点发送探测包并即时刷新最优路由与 NAT 检测 |
+| `nat` | | 主动向多台公网 STUN 服务器发起并发探测，展示详细的 NAT 映射行为与端口增量步长 |
+| `mode [模式]` | `m` | 查看当前路由模式或动态切换（支持 `auto`、`direct-only`、`relay-only`） |
+| `candidates` | `list`, `ls` | 简要列出当前所有服务端候选节点 |
+| `version` | `ver`, `v` | 查看客户端版本号 |
+| `help` | `h`, `?` | 显示可用交互命令帮助菜单 |
+| `quit` | `exit`, `q` | 优雅停止所有协程并退出客户端 |
+
 
 ## 许可证
 

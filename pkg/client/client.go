@@ -73,6 +73,7 @@ type Client struct {
 	a2sQueryAddr     atomic.Pointer[net.UDPAddr] // Server-browser A2S query socket (separate from the game netchannel socket).
 	gameConnAddr     atomic.Pointer[net.UDPAddr] // Current game netchannel socket, for open/close logging.
 	gameConnLastSeen atomic.Int64                // UnixNano of the last packet from the game netchannel socket.
+	natInfo          atomic.Pointer[stun.NATMappingInfo]
 	router           *router.Router
 	holePuncher      *stun.HolePuncher
 	lastReportedPath router.PathType
@@ -178,9 +179,10 @@ func (s *Client) Start() error {
 		log.Printf("[Client] STUN hole-punching disabled (enable_punch=%v)", s.cfg.EnablePunch)
 	}
 
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.localReadLoop()
 	go s.pingProbeLoop()
+	go s.detectNATLoop()
 
 	return nil
 }
@@ -1101,4 +1103,288 @@ func (s *Client) Stop() {
 
 	s.wg.Wait()
 	log.Printf("[Client] Client stopped successfully")
+}
+
+// CandidateStatus holds snapshot information about a server candidate.
+type CandidateStatus struct {
+	Addr          string          `json:"addr"`
+	ResolvedIP    string          `json:"resolved_ip"`
+	Online        bool            `json:"online"`
+	RTT           time.Duration   `json:"rtt"`
+	PathType      router.PathType `json:"path_type"`
+	PathHint      string          `json:"path_hint"`
+	IsLAN         bool            `json:"is_lan"`
+	IsPunch       bool            `json:"is_punch"`
+	IsActive      bool            `json:"is_active"`
+	LastActive    time.Time       `json:"last_active"`
+	PubEndpoint   string          `json:"pub_endpoint,omitempty"`
+	LastReflected string          `json:"last_reflected,omitempty"`
+}
+
+// ClientStatus holds snapshot information about the client state.
+type ClientStatus struct {
+	SessionID       uint64               `json:"session_id"`
+	ListenAddr      string               `json:"listen_addr"`
+	Mode            string               `json:"mode"`
+	ActivePath      router.PathType      `json:"active_path"`
+	ActiveCandidate string               `json:"active_candidate"`
+	ActiveRTT       time.Duration        `json:"active_rtt"`
+	GameConnected   bool                 `json:"game_connected"`
+	GameAddr        string               `json:"game_addr,omitempty"`
+	GameLastSeen    time.Time            `json:"game_last_seen,omitempty"`
+	PunchEnabled    bool                 `json:"punch_enabled"`
+	NATSummary      string               `json:"nat_summary"`
+	NATInfo         *stun.NATMappingInfo `json:"nat_info,omitempty"`
+	Candidates      []CandidateStatus    `json:"candidates"`
+}
+
+// Status returns a point-in-time snapshot of the client state.
+func (s *Client) Status() ClientStatus {
+	s.candidateMu.RLock()
+	activeCand := s.bestCandidate
+	cands := make([]*serverCandidate, len(s.candidates))
+	copy(cands, s.candidates)
+	mode := s.cfg.Mode
+	listenAddr := s.cfg.ListenAddr
+	enablePunch := s.cfg.EnablePunch
+	s.candidateMu.RUnlock()
+
+	activeCandStr := ""
+	var activeRTT time.Duration
+	if activeCand != nil && activeCand.online {
+		activeCandStr = activeCand.addrStr
+		activeCand.mu.RLock()
+		activeRTT = activeCand.rtt
+		if activeCand.udpAddr != nil && activeCand.addrStr != activeCand.udpAddr.String() {
+			activeCandStr = fmt.Sprintf("%s (%s)", activeCand.addrStr, activeCand.udpAddr.String())
+		}
+		activeCand.mu.RUnlock()
+	}
+
+	gameAddr := s.gameConnAddr.Load()
+	gameLastSeenNano := s.gameConnLastSeen.Load()
+	gameConnected := gameAddr != nil
+	var gameLastSeen time.Time
+	var gameAddrStr string
+	if gameLastSeenNano > 0 {
+		gameLastSeen = time.Unix(0, gameLastSeenNano)
+	}
+	if gameAddr != nil {
+		gameAddrStr = gameAddr.String()
+	}
+
+	natInfo := s.natInfo.Load()
+	natSummary := stun.FormatNATSummary(natInfo)
+
+	candStatuses := make([]CandidateStatus, 0, len(cands))
+	for _, c := range cands {
+		c.mu.RLock()
+		resolvedIP := ""
+		if c.udpAddr != nil {
+			resolvedIP = c.udpAddr.String()
+		}
+		isActive := (c == activeCand && c.online)
+		candStatuses = append(candStatuses, CandidateStatus{
+			Addr:          c.addrStr,
+			ResolvedIP:    resolvedIP,
+			Online:        c.online,
+			RTT:           c.rtt,
+			PathType:      s.pathForCandidate(c),
+			PathHint:      c.pathHint,
+			IsLAN:         c.isLAN,
+			IsPunch:       c.isPunch,
+			IsActive:      isActive,
+			LastActive:    c.lastActive,
+			PubEndpoint:   c.pubEndpoint,
+			LastReflected: c.lastReflected,
+		})
+		c.mu.RUnlock()
+	}
+
+	return ClientStatus{
+		SessionID:       s.sessionID.Load(),
+		ListenAddr:      listenAddr,
+		Mode:            mode,
+		ActivePath:      s.router.CurrentPath(),
+		ActiveCandidate: activeCandStr,
+		ActiveRTT:       activeRTT,
+		GameConnected:   gameConnected,
+		GameAddr:        gameAddrStr,
+		GameLastSeen:    gameLastSeen,
+		PunchEnabled:    enablePunch,
+		NATSummary:      natSummary,
+		NATInfo:         natInfo,
+		Candidates:      candStatuses,
+	}
+}
+
+// FormatStatus returns a human-readable, well-formatted status string.
+func (s *Client) FormatStatus() string {
+	st := s.Status()
+	var b strings.Builder
+
+	b.WriteString("\n============================= Left4Proxy Status =============================\n")
+	if st.SessionID != 0 {
+		fmt.Fprintf(&b, "  Session ID       : %d\n", st.SessionID)
+	} else {
+		b.WriteString("  Session ID       : Not established (Waiting for handshake)\n")
+	}
+	fmt.Fprintf(&b, "  Listen Address   : %s\n", st.ListenAddr)
+	fmt.Fprintf(&b, "  Routing Mode     : %s\n", st.Mode)
+
+	if st.ActiveCandidate != "" {
+		rttStr := "N/A"
+		if st.ActiveRTT > 0 && st.ActiveRTT < 900*time.Millisecond {
+			rttStr = fmt.Sprintf("%.1fms", float64(st.ActiveRTT)/float64(time.Millisecond))
+		}
+		fmt.Fprintf(&b, "  Active Route     : [%s] -> %s (RTT: %s)\n", st.ActivePath, st.ActiveCandidate, rttStr)
+	} else {
+		b.WriteString("  Active Route     : None (All candidates offline / Handshaking)\n")
+	}
+
+	if st.GameConnected {
+		ago := time.Since(st.GameLastSeen).Truncate(100 * time.Millisecond)
+		fmt.Fprintf(&b, "  Game Connection  : Active (%s, last packet %v ago)\n", st.GameAddr, ago)
+	} else if !st.GameLastSeen.IsZero() {
+		ago := time.Since(st.GameLastSeen).Truncate(time.Second)
+		fmt.Fprintf(&b, "  Game Connection  : Idle (Disconnected %v ago)\n", ago)
+	} else {
+		b.WriteString("  Game Connection  : Idle (No game connected yet)\n")
+	}
+
+	fmt.Fprintf(&b, "  NAT Mapping Type : %s\n", st.NATSummary)
+
+	punchStr := "Disabled"
+	if st.PunchEnabled {
+		punchStr = "Enabled"
+	}
+	fmt.Fprintf(&b, "  STUN Hole Punch  : %s\n", punchStr)
+
+	fmt.Fprintf(&b, "\nCandidates (%d):\n", len(st.Candidates))
+	for i, c := range st.Candidates {
+		marker := "  "
+		if c.IsActive {
+			marker = "* "
+		}
+
+		statusStr := "Offline"
+		rttStr := "N/A"
+		if c.Online {
+			statusStr = "Online"
+			if c.RTT > 0 && c.RTT < 900*time.Millisecond {
+				rttStr = fmt.Sprintf("%.1fms", float64(c.RTT)/float64(time.Millisecond))
+			}
+		}
+
+		addrDisplay := c.Addr
+		if c.ResolvedIP != "" && c.ResolvedIP != c.Addr {
+			addrDisplay = fmt.Sprintf("%s (%s)", c.Addr, c.ResolvedIP)
+		}
+
+		lastSeenStr := "Never"
+		if !c.LastActive.IsZero() {
+			lastSeenStr = fmt.Sprintf("%v ago", time.Since(c.LastActive).Truncate(100*time.Millisecond))
+		}
+
+		fmt.Fprintf(&b, "%s[%d] %-8s %s\n", marker, i+1, fmt.Sprintf("[%s]", c.PathType), addrDisplay)
+		fmt.Fprintf(&b, "      Status: %-7s | RTT: %-7s | LAN: %-5v | Last Seen: %s\n",
+			statusStr, rttStr, c.IsLAN, lastSeenStr)
+
+		if c.PubEndpoint != "" {
+			fmt.Fprintf(&b, "      Local NAT Mapped : %s\n", c.PubEndpoint)
+		}
+		if c.LastReflected != "" && c.LastReflected != c.PubEndpoint {
+			fmt.Fprintf(&b, "      Reflected Addr   : %s\n", c.LastReflected)
+		}
+	}
+	b.WriteString("=============================================================================\n")
+
+	return b.String()
+}
+
+// detectNATLoop runs NAT detection on start.
+func (s *Client) detectNATLoop() {
+	defer s.wg.Done()
+	s.DetectNAT()
+}
+
+// DetectNAT performs STUN-based NAT mapping detection and updates the cached NAT info.
+func (s *Client) DetectNAT() *stun.NATMappingInfo {
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stunServer := ""
+	if s.cfg != nil {
+		stunServer = s.cfg.StunServer
+	}
+	info, err := stun.DetectClientNAT(ctx, stunServer, 3*time.Second)
+	if err != nil {
+		log.Printf("[Client] STUN NAT detection: %v", err)
+		return nil
+	}
+	s.natInfo.Store(info)
+	log.Printf("[Client] Local NAT Type detected -> %s", stun.FormatNATSummary(info))
+	return info
+}
+
+// Probe actively sends ping probe packets to all candidates and refreshes route state and NAT type.
+func (s *Client) Probe() {
+	seq := atomic.AddUint32(&s.seq, 1)
+	pingPkt := protocol.NewPacket(protocol.CmdPing, s.sessionID.Load(), seq, []byte("PING"))
+	marshaledPing := pingPkt.Marshal()
+
+	s.candidateMu.RLock()
+	cands := make([]*serverCandidate, len(s.candidates))
+	copy(cands, s.candidates)
+	s.candidateMu.RUnlock()
+
+	for _, cand := range cands {
+		_ = cand.send(marshaledPing)
+		cand.mu.RLock()
+		isPunch := cand.isPunch
+		online := cand.online
+		cand.mu.RUnlock()
+		if !isPunch && !online {
+			s.sendHandshake(cand)
+		}
+	}
+
+	// Trigger async NAT re-detection if unknown
+	if s.natInfo.Load() == nil {
+		go s.DetectNAT()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	s.selectBestCandidate()
+}
+
+// SetMode changes the routing mode dynamically ("auto", "direct-only", "relay-only").
+func (s *Client) SetMode(mode string) error {
+	switch strings.ToLower(mode) {
+	case "auto":
+		mode = "auto"
+	case "direct-only", "direct":
+		mode = "direct-only"
+	case "relay-only", "relay":
+		mode = "relay-only"
+	default:
+		return fmt.Errorf("invalid route mode %q: must be 'auto', 'direct-only' (or 'direct'), or 'relay-only' (or 'relay')", mode)
+	}
+
+	s.candidateMu.Lock()
+	s.cfg.Mode = mode
+	s.candidateMu.Unlock()
+
+	s.router.SetMode(mode)
+	s.selectBestCandidate()
+	log.Printf("[Client] Route mode switched to: %s", mode)
+	return nil
+}
+
+// GetMode returns the current routing mode.
+func (s *Client) GetMode() string {
+	s.candidateMu.RLock()
+	defer s.candidateMu.RUnlock()
+	return s.cfg.Mode
 }

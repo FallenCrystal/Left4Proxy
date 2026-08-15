@@ -31,6 +31,9 @@ type NATMappingInfo struct {
 // DetectNATMapping queries two distinct STUN servers from the same UDP socket to determine
 // whether the NAT employs Endpoint-Independent Mapping (Cone) or Symmetric Mapping.
 func DetectNATMapping(ctx context.Context, conn *net.UDPConn, server1, server2 *net.UDPAddr, timeout time.Duration) (*NATMappingInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if conn == nil {
 		return nil, errors.New("udp connection is nil")
 	}
@@ -109,4 +112,124 @@ func DetectNATMapping(ctx context.Context, conn *net.UDPConn, server1, server2 *
 	}
 
 	return info, nil
+}
+
+// DetectClientNAT opens an ephemeral UDP socket and queries multiple public STUN servers
+// to detect the local network's NAT mapping behavior (Cone NAT vs Symmetric NAT).
+func DetectClientNAT(ctx context.Context, customStunServer string, timeout time.Duration) (*NATMappingInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stunCandidates := []string{}
+	if customStunServer != "" {
+		stunCandidates = append(stunCandidates, customStunServer)
+	}
+	stunCandidates = append(stunCandidates, DefaultStunServers...)
+	addrs := ResolveStunServers(stunCandidates)
+	if len(addrs) == 0 {
+		return nil, errors.New("no STUN servers could be resolved")
+	}
+
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create probe socket: %w", err)
+	}
+	defer conn.Close()
+
+	if len(addrs) == 1 {
+		return DetectNATMapping(ctx, conn, addrs[0], addrs[0], timeout)
+	}
+
+	// Send requests to all resolved STUN servers
+	req := BuildBindingRequest()
+	for _, addr := range addrs {
+		_, _ = conn.WriteToUDP(req, addr)
+	}
+
+	deadline := time.Now().Add(timeout)
+	buf := make([]byte, 2048)
+	reflections := make(map[string]*net.UDPAddr)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, src, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		if !IsStunResponse(buf[:n]) {
+			continue
+		}
+
+		reflected, err := ParseBindingResponse(buf[:n])
+		if err != nil {
+			continue
+		}
+
+		reflections[src.String()] = reflected
+		if len(reflections) >= 2 {
+			break
+		}
+	}
+
+	if len(reflections) == 0 {
+		return nil, errors.New("no STUN response received from servers")
+	}
+
+	info := &NATMappingInfo{
+		Behavior: MappingUnknown,
+	}
+
+	var endpoints []*net.UDPAddr
+	for _, ep := range reflections {
+		endpoints = append(endpoints, ep)
+	}
+
+	info.PrimaryAddr = endpoints[0]
+	if len(endpoints) == 1 {
+		return info, nil
+	}
+
+	info.SecondaryAddr = endpoints[1]
+
+	if info.PrimaryAddr.IP.Equal(info.SecondaryAddr.IP) && info.PrimaryAddr.Port == info.SecondaryAddr.Port {
+		info.Behavior = MappingEndpointIndependent
+		info.PortDelta = 0
+	} else {
+		info.Behavior = MappingAddressOrPortDependent
+		info.PortDelta = info.SecondaryAddr.Port - info.PrimaryAddr.Port
+	}
+
+	return info, nil
+}
+
+// FormatNATSummary returns a concise, human-friendly summary string of the NAT mapping behavior.
+func FormatNATSummary(info *NATMappingInfo) string {
+	if info == nil {
+		return "Detecting / Not tested"
+	}
+	switch info.Behavior {
+	case MappingEndpointIndependent:
+		if info.PrimaryAddr != nil {
+			return fmt.Sprintf("Cone NAT (NAT 1-3, Endpoint-Independent) [Public IP: %s]", info.PrimaryAddr.IP.String())
+		}
+		return "Cone NAT (NAT 1-3, Endpoint-Independent) [Direct/Punch Supported]"
+	case MappingAddressOrPortDependent:
+		deltaStr := ""
+		if info.PortDelta != 0 {
+			deltaStr = fmt.Sprintf(", Delta: %+d", info.PortDelta)
+		}
+		return fmt.Sprintf("Symmetric NAT (NAT 4, Address/Port-Dependent%s) [Relay Recommended]", deltaStr)
+	default:
+		if info.PrimaryAddr != nil {
+			return fmt.Sprintf("Single Reflection (%s) [Behavior Unknown]", info.PrimaryAddr.String())
+		}
+		return "Unknown / STUN unreachable"
+	}
 }

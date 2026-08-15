@@ -2,12 +2,14 @@ package client
 
 import (
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"left4proxy/pkg/config"
 	"left4proxy/pkg/router"
 	"left4proxy/pkg/server"
+	"left4proxy/pkg/stun"
 )
 
 // TestA2SResponseRouting verifies the A2S helpers distinguish the server
@@ -46,7 +48,6 @@ func TestA2SResponseRouting(t *testing.T) {
 		t.Fatalf("isA2SResponse(connect challenge) = true, want false")
 	}
 }
-
 
 func TestPathForCandidate(t *testing.T) {
 	c := &Client{}
@@ -210,4 +211,83 @@ func TestClientServerIntegration(t *testing.T) {
 		t.Fatalf("expected packet size >= %d, got %d", len(a2sQuery), n)
 	}
 	t.Logf("Successfully proxied L4D2 packet through Left4Proxy! Received %d bytes from %s", n, srcAddr.String())
+}
+
+func TestClientStatusReporting(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	cfg.ListenAddr = "127.0.0.2:27015"
+	cfg.Mode = "auto"
+	cfg.EnablePunch = true
+
+	cli, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	candPunch := mkCand("1.2.3.4:27015", 25*time.Millisecond, true, false)
+	candPunch.isPunch = true
+	candPunch.pathHint = "punch"
+	candPunch.pubEndpoint = "114.240.1.2:58210"
+	candPunch.lastReflected = "114.240.1.2:58210"
+
+	candRelay := mkCand("5.6.7.8:27014", 60*time.Millisecond, false, false)
+	candRelay.pathHint = "relay"
+
+	cli.candidates = []*serverCandidate{candPunch, candRelay}
+	cli.bestCandidate = candPunch
+	cli.sessionID.Store(987654321)
+
+	// Status snapshot
+	st := cli.Status()
+	if st.SessionID != 987654321 {
+		t.Errorf("expected session ID 987654321, got %d", st.SessionID)
+	}
+	if st.ListenAddr != "127.0.0.2:27015" {
+		t.Errorf("expected listen addr 127.0.0.2:27015, got %s", st.ListenAddr)
+	}
+	if len(st.Candidates) != 2 {
+		t.Errorf("expected 2 candidates, got %d", len(st.Candidates))
+	}
+	if !st.Candidates[0].IsActive {
+		t.Errorf("expected candidate 0 to be active")
+	}
+
+	// Test game connection tracking
+	gameAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:51234")
+	cli.trackGameConnection(gameAddr)
+
+	stActiveGame := cli.Status()
+	if !stActiveGame.GameConnected || stActiveGame.GameAddr != "127.0.0.1:51234" {
+		t.Errorf("expected game connection to 127.0.0.1:51234, got %v (%s)", stActiveGame.GameConnected, stActiveGame.GameAddr)
+	}
+
+	// Set mock NAT info
+	mockNAT := &stun.NATMappingInfo{
+		Behavior:    stun.MappingEndpointIndependent,
+		PrimaryAddr: &net.UDPAddr{IP: net.ParseIP("114.240.1.2"), Port: 58210},
+	}
+	cli.natInfo.Store(mockNAT)
+
+	// Verify formatted status output
+	formatted := cli.FormatStatus()
+	if !strings.Contains(formatted, "987654321") {
+		t.Errorf("formatted status missing session ID: %s", formatted)
+	}
+	if !strings.Contains(formatted, "114.240.1.2:58210") {
+		t.Errorf("formatted status missing STUN endpoint: %s", formatted)
+	}
+	if !strings.Contains(formatted, "127.0.0.1:51234") {
+		t.Errorf("formatted status missing game addr: %s", formatted)
+	}
+	if !strings.Contains(formatted, "NAT Mapping Type") || !strings.Contains(formatted, "Cone NAT") {
+		t.Errorf("formatted status missing NAT info: %s", formatted)
+	}
+
+	// Test SetMode / GetMode
+	if err := cli.SetMode("relay-only"); err != nil {
+		t.Fatalf("SetMode error: %v", err)
+	}
+	if cli.GetMode() != "relay-only" {
+		t.Errorf("expected mode relay-only, got %s", cli.GetMode())
+	}
 }

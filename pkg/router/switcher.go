@@ -178,6 +178,21 @@ func (r *Router) CurrentPath() PathType {
 	return r.current
 }
 
+// SetMode dynamically changes the routing mode and re-evaluates the active path.
+func (r *Router) SetMode(mode string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mode = mode
+	r.evaluatePath()
+}
+
+// Mode returns the current configured route mode.
+func (r *Router) Mode() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mode
+}
+
 // GetStatusString returns human-readable path status.
 func (r *Router) GetStatusString() string {
 	r.mu.RLock()
