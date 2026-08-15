@@ -8,7 +8,11 @@ import (
 )
 
 var (
-	Magic = [4]byte{'L', '4', 'D', 'P'}
+	wireMagic = [...]byte{'L', '4', 'D', 'P'}
+	// Magic is retained as a compatibility value for callers constructing test
+	// fixtures. Runtime framing uses wireMagic so an external assignment cannot
+	// change the protocol recognizer while the process is running.
+	Magic = wireMagic
 )
 
 const (
@@ -20,8 +24,6 @@ const (
 
 	CmdHandshakeReq  byte = 0x01
 	CmdHandshakeResp byte = 0x02
-	CmdLanProbe      byte = 0x03
-	CmdLanAck        byte = 0x04
 	CmdStunProbe     byte = 0x05
 	CmdStunAck       byte = 0x06
 	CmdPing          byte = 0x07
@@ -31,50 +33,20 @@ const (
 	CmdPunchInit     byte = 0x0B // client→server (over relay): client's direct-socket public endpoint
 	CmdPunchAck      byte = 0x0C // server→client: PunchInit acknowledged
 
-	// Authenticated path hints are carried in CmdPong payloads.  They are
-	// deliberately not inferred from the destination address: a loopback or
-	// private address can still be a local relay tunnel, and only the server's
-	// authenticated classification is authoritative.
-	PathHintLAN    = "lan"
-	PathHintRelay  = "relay"
-	PathHintPunch  = "punch"
-	PathHintDirect = "direct"
-	pathHintPrefix = "L4PATH:"
-
 	HeaderSize = 28 // 4 + 1 + 1 + 8 + 4 + 8 + 2
+
+	// IPv4/IPv6 UDP leaves at most 65507 bytes for one datagram payload. Keep
+	// the protocol parser and AEAD sender within that bound instead of allowing
+	// a syntactically valid uint16 payload length that can never traverse UDP.
+	MaxUDPPayloadSize    = 65507
+	MaxPacketPayloadSize = MaxUDPPayloadSize - HeaderSize
 )
-
-// EncodePathHint creates the authenticated payload used by a ping response.
-// An empty result means path is not one of the protocol's known classes.
-func EncodePathHint(path string) []byte {
-	switch path {
-	case PathHintLAN, PathHintRelay, PathHintPunch, PathHintDirect:
-		return []byte(pathHintPrefix + path)
-	default:
-		return nil
-	}
-}
-
-// DecodePathHint validates and extracts a server path classification from an
-// authenticated CmdPong payload.
-func DecodePathHint(payload []byte) (string, bool) {
-	const prefixLen = len(pathHintPrefix)
-	if len(payload) <= prefixLen || string(payload[:prefixLen]) != pathHintPrefix {
-		return "", false
-	}
-	path := string(payload[prefixLen:])
-	switch path {
-	case PathHintLAN, PathHintRelay, PathHintPunch, PathHintDirect:
-		return path, true
-	default:
-		return "", false
-	}
-}
 
 var (
 	ErrInvalidMagic   = errors.New("invalid protocol magic header")
 	ErrInvalidVersion = errors.New("unsupported protocol version")
 	ErrBufferTooShort = errors.New("packet buffer too short")
+	ErrPacketTooLarge = errors.New("packet payload too large for UDP")
 	ErrNotL4D2Packet  = errors.New("not a valid L4D2/Source Engine packet")
 )
 
@@ -122,7 +94,7 @@ func (p *Packet) MarshalHeader(payloadLen int) []byte {
 		payloadLen = int(^uint16(0))
 	}
 	buf := make([]byte, HeaderSize)
-	copy(buf[0:4], Magic[:])
+	copy(buf[0:4], wireMagic[:])
 	buf[4] = p.Version
 	buf[5] = p.Cmd
 	binary.BigEndian.PutUint64(buf[6:14], p.SessionID)
@@ -137,7 +109,7 @@ func Unmarshal(data []byte) (*Packet, error) {
 	if len(data) < HeaderSize {
 		return nil, ErrBufferTooShort
 	}
-	if data[0] != Magic[0] || data[1] != Magic[1] || data[2] != Magic[2] || data[3] != Magic[3] {
+	if data[0] != wireMagic[0] || data[1] != wireMagic[1] || data[2] != wireMagic[2] || data[3] != wireMagic[3] {
 		return nil, ErrInvalidMagic
 	}
 	ver := data[4]
@@ -149,6 +121,9 @@ func Unmarshal(data []byte) (*Packet, error) {
 	seq := binary.BigEndian.Uint32(data[14:18])
 	ts := int64(binary.BigEndian.Uint64(data[18:26]))
 	payloadLen := int(binary.BigEndian.Uint16(data[26:28]))
+	if payloadLen > MaxPacketPayloadSize {
+		return nil, fmt.Errorf("%w: declared payload len %d", ErrPacketTooLarge, payloadLen)
+	}
 
 	if len(data) < HeaderSize+payloadLen {
 		return nil, fmt.Errorf("%w: expected payload len %d, got %d", ErrBufferTooShort, payloadLen, len(data)-HeaderSize)
@@ -174,7 +149,7 @@ func Unmarshal(data []byte) (*Packet, error) {
 
 // IsL4D2Packet inspects the payload to verify whether it matches Source Engine / L4D2 UDP packet signature.
 func IsL4D2Packet(payload []byte) bool {
-	if len(payload) < 4 {
+	if len(payload) < 4 || len(payload) > MaxUDPPayloadSize {
 		return false
 	}
 	// Source Engine OOB (Out of Band) queries start with 0xFF 0xFF 0xFF 0xFF

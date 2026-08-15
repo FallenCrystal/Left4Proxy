@@ -93,3 +93,47 @@ func TestExtractLocation(t *testing.T) {
 		t.Errorf("extractLocation got %q, want http://192.168.1.1:49152/rootDesc.xml", loc)
 	}
 }
+
+func TestUPnPRejectsHTTPFailuresAndBoundsBodies(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("gateway failure"))
+	}))
+	defer server.Close()
+
+	if _, err := parseRootDesc(context.Background(), server.Client(), server.URL+"/rootDesc.xml"); err == nil {
+		t.Fatal("non-success root description status was accepted")
+	}
+
+	mapper := &UPnPMapper{
+		controlURL:  server.URL,
+		serviceType: "urn:schemas-upnp-org:service:WANIPConnection:1",
+		httpClient:  server.Client(),
+	}
+	if err := mapper.DeletePortMapping(context.Background(), 27014); err == nil {
+		t.Fatal("non-success DeletePortMapping status was accepted")
+	}
+	if err := mapper.AddPortMapping(context.Background(), 0, 27014, "192.168.1.2", "test"); err == nil {
+		t.Fatal("invalid mapping port was accepted")
+	}
+}
+
+func TestUPnPRejectsUnsafeDescriptionURL(t *testing.T) {
+	client := &http.Client{}
+	for _, location := range []string{"file:///tmp/root.xml", "http://user:pass@example.com/root.xml", "not a url"} {
+		if _, err := parseRootDesc(context.Background(), client, location); err == nil {
+			t.Fatalf("unsafe location %q was accepted", location)
+		}
+	}
+}
+
+func TestUPnPRejectsSOAPActionHeaderInjection(t *testing.T) {
+	for _, serviceType := range []string{
+		"urn:schemas-upnp-org:service:WANIPConnection:1\"\r\nX-Injected: yes",
+		"urn:schemas-upnp-org:service:WANIPConnection:1\tbad",
+	} {
+		if _, err := soapAction(serviceType, "GetExternalIPAddress"); err == nil {
+			t.Fatalf("unsafe service type %q was accepted", serviceType)
+		}
+	}
+}

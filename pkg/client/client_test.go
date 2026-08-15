@@ -3,15 +3,55 @@ package client
 import (
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"left4proxy/pkg/config"
-	"left4proxy/pkg/protocol"
 	"left4proxy/pkg/router"
 	"left4proxy/pkg/server"
 	"left4proxy/pkg/stun"
 )
+
+func TestClientConcurrentStartStopDoesNotLeakOrHang(t *testing.T) {
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	for i := 0; i < 20; i++ {
+		cfg := config.DefaultClientConfig()
+		cfg.ServerAddrs = []string{peer.LocalAddr().String()}
+		cfg.ListenAddr = "127.0.0.1:0"
+		cfg.Mode = "relay-only"
+		cfg.EnablePunch = false
+		cfg.AuthKey = integrationKey()
+		cli, err := NewClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var callers sync.WaitGroup
+		callers.Add(2)
+		go func() {
+			defer callers.Done()
+			_ = cli.Start()
+		}()
+		go func() {
+			defer callers.Done()
+			cli.Stop()
+		}()
+		done := make(chan struct{})
+		go func() { callers.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent client Start/Stop hung")
+		}
+		cli.Stop()
+	}
+}
 
 // TestA2SResponseRouting verifies the A2S helpers distinguish the server
 // browser's query/response packets from the game's netchannel connect
@@ -55,11 +95,11 @@ func TestPathForCandidate(t *testing.T) {
 
 	lan := mkCand("192.168.1.5:27014", 0, false, true)
 	relay := mkCand("1.2.3.4:27014", 0, false, false)
-	relay.pathHint = "relay"
+	relay.pathClass = "relay"
 	direct := mkCand("5.6.7.8:27014", 0, false, false)
-	direct.pathHint = "direct"
+	direct.pathClass = "direct"
 	punch := mkCand("9.9.9.9:27014", 0, false, false)
-	punch.pathHint = "punch"
+	punch.pathClass = "punch"
 	unknown := mkCand("8.8.8.8:27014", 0, false, false) // no hint yet (old server / pre-handshake)
 
 	got := func(cand *serverCandidate) router.PathType { return c.pathForCandidate(cand) }
@@ -81,12 +121,33 @@ func TestPathForCandidate(t *testing.T) {
 	}
 }
 
+func TestAdvertisedAddressPromotesConfiguredEntry(t *testing.T) {
+	c := &Client{}
+	local := mkCand("127.0.0.1:27014", 0, false, true)
+	local.pathClass = candidatePathRelay
+	c.setCandidatePath(local, candidatePathDirect)
+	if local.pathClass != candidatePathLAN {
+		t.Fatalf("advertised local entry path = %q, want LAN", local.pathClass)
+	}
+
+	public := mkCand("198.51.100.20:27014", 0, false, false)
+	public.pathClass = candidatePathRelay
+	c.setCandidatePath(public, candidatePathDirect)
+	if public.pathClass != candidatePathDirect {
+		t.Fatalf("advertised public entry path = %q, want Direct", public.pathClass)
+	}
+	c.setCandidatePath(public, candidatePathRelay)
+	if public.pathClass != candidatePathDirect {
+		t.Fatal("configured relay role downgraded authenticated direct provenance")
+	}
+}
+
 // mkCand builds a serverCandidate with the given characteristics for routing tests.
 func mkCand(addr string, rtt time.Duration, online, lan bool) *serverCandidate {
 	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
 	hint := ""
 	if lan {
-		hint = protocol.PathHintLAN
+		hint = candidatePathLAN
 	}
 	return &serverCandidate{
 		addrStr:    addr,
@@ -94,7 +155,7 @@ func mkCand(addr string, rtt time.Duration, online, lan bool) *serverCandidate {
 		online:     online,
 		rtt:        rtt,
 		isLAN:      lan,
-		pathHint:   hint,
+		pathClass:  hint,
 		lastActive: time.Now(),
 	}
 }
@@ -105,8 +166,8 @@ func TestClientModeRouting(t *testing.T) {
 	lan := mkCand("192.168.1.5:27014", 1*time.Millisecond, true, true)
 	wanSlow := mkCand("203.0.113.1:27014", 50*time.Millisecond, true, false)
 	wanFast := mkCand("198.51.100.1:27014", 20*time.Millisecond, true, false)
-	wanSlow.pathHint = "relay"
-	wanFast.pathHint = "direct"
+	wanSlow.pathClass = "relay"
+	wanFast.pathClass = "direct"
 
 	c := &Client{cfg: cfg}
 
@@ -156,9 +217,9 @@ func TestClientModeRouting(t *testing.T) {
 	// relay-only must fail closed when no candidate is explicitly classified as
 	// relay; a direct or punched endpoint must never become the destination.
 	directOnly := mkCand("198.51.100.20:27014", 5*time.Millisecond, true, false)
-	directOnly.pathHint = "direct"
+	directOnly.pathClass = "direct"
 	punchOnly := mkCand("198.51.100.21:27014", 4*time.Millisecond, true, false)
-	punchOnly.pathHint = "punch"
+	punchOnly.pathClass = "punch"
 	punchOnly.isPunch = true
 	cfg.Mode = "relay-only"
 	c.candidates = []*serverCandidate{directOnly, punchOnly}
@@ -170,28 +231,65 @@ func TestClientModeRouting(t *testing.T) {
 	if c.candidateAllowed(directOnly) || c.candidateAllowed(punchOnly) {
 		t.Fatal("relay-only marked a direct/punch candidate as allowed")
 	}
+
+	// Auto/direct-only must also clear a stale route when every candidate is
+	// unavailable; retaining the old pointer would keep the data plane sending
+	// after the selector has found no legal path.
+	c.cfg.Mode = "auto"
+	c.candidates = []*serverCandidate{directOnly}
+	directOnly.mu.Lock()
+	directOnly.online = false
+	directOnly.lastActive = time.Time{}
+	directOnly.mu.Unlock()
+	c.bestCandidate = directOnly
+	c.selectBestCandidate()
+	if c.bestCandidate != nil {
+		t.Fatalf("auto retained unavailable candidate %s", c.bestCandidate.addrStr)
+	}
 }
 
-func TestRelayOnlyTrustsAuthenticatedPathHint(t *testing.T) {
+func TestRelayOnlyUsesCandidateProvenance(t *testing.T) {
 	cfg := config.DefaultClientConfig()
 	cfg.Mode = "relay-only"
 	c := &Client{cfg: cfg}
 
-	// A local tunnel endpoint may resolve to loopback/private space. The
-	// authenticated server label must still admit it as Relay.
+	// A configured relay endpoint may resolve to loopback/private space. Its
+	// configured provenance still takes priority over address shape.
 	localRelay := mkCand("127.0.0.1:27014", 5*time.Millisecond, true, true)
-	localRelay.pathHint = protocol.PathHintRelay
+	localRelay.pathClass = candidatePathRelay
 	if !c.candidateAllowed(localRelay) {
-		t.Fatal("relay-only rejected an authenticated relay on a local address")
+		t.Fatal("relay-only rejected a configured relay on a local address")
 	}
 
-	localRelay.pathHint = protocol.PathHintDirect
+	localRelay.pathClass = candidatePathDirect
 	if c.candidateAllowed(localRelay) {
 		t.Fatal("relay-only admitted a direct candidate with a local address")
 	}
-	localRelay.pathHint = ""
+	localRelay.pathClass = ""
 	if c.candidateAllowed(localRelay) {
 		t.Fatal("relay-only admitted an unclassified candidate")
+	}
+}
+
+func TestConfiguredRelayDoesNotReceiveLANPreference(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	c := &Client{cfg: cfg}
+
+	// Local tunnel processes commonly expose the relay on loopback. Its
+	// configured Relay classification must override the address-based LAN
+	// hint, otherwise the 10x LAN preference prevents a faster punched path
+	// from ever being selected.
+	localRelay := mkCand("127.0.0.1:27014", 50*time.Millisecond, true, true)
+	localRelay.pathClass = candidatePathRelay
+	punch := mkCand("198.51.100.20:27014", 20*time.Millisecond, true, false)
+	punch.pathClass = candidatePathPunch
+	punch.isPunch = true
+
+	c.candidates = []*serverCandidate{localRelay, punch}
+	c.bestCandidate = localRelay
+	c.selectBestCandidate()
+	if c.bestCandidate != punch {
+		t.Fatalf("configured loopback relay retained LAN preference; selected %v", c.bestCandidate)
 	}
 }
 
@@ -277,12 +375,12 @@ func TestClientStatusReporting(t *testing.T) {
 
 	candPunch := mkCand("1.2.3.4:27015", 25*time.Millisecond, true, false)
 	candPunch.isPunch = true
-	candPunch.pathHint = "punch"
+	candPunch.pathClass = "punch"
 	candPunch.pubEndpoint = "114.240.1.2:58210"
 	candPunch.lastReflected = "114.240.1.2:58210"
 
 	candRelay := mkCand("5.6.7.8:27014", 60*time.Millisecond, false, false)
-	candRelay.pathHint = "relay"
+	candRelay.pathClass = "relay"
 
 	cli.candidates = []*serverCandidate{candPunch, candRelay}
 	cli.bestCandidate = candPunch
@@ -301,6 +399,9 @@ func TestClientStatusReporting(t *testing.T) {
 	}
 	if !st.Candidates[0].IsActive {
 		t.Errorf("expected candidate 0 to be active")
+	}
+	if st.ActivePath != router.PathPunch {
+		t.Errorf("active path = %q, want actual candidate path %q", st.ActivePath, router.PathPunch)
 	}
 
 	// Test game connection tracking

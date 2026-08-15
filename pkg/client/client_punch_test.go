@@ -17,14 +17,17 @@ import (
 const stunMagicCookie = uint32(0x2112A442)
 
 // mockStunBindingResponse builds a STUN Binding Response whose
-// XOR-MAPPED-ADDRESS reflects src (IPv4). Mirrors RFC 5389 §15.2.
-func mockStunBindingResponse(src *net.UDPAddr) []byte {
+// XOR-MAPPED-ADDRESS reflects src (IPv4). Mirrors RFC 5389 §15.2 and echoes
+// the request transaction ID so the production Validator can authenticate it.
+func mockStunBindingResponse(request []byte, src *net.UDPAddr) []byte {
 	ip4 := src.IP.To4()
 	resp := make([]byte, 20+12)
 	binary.BigEndian.PutUint16(resp[0:2], 0x0101) // Binding Response
 	binary.BigEndian.PutUint16(resp[2:4], 12)     // total attribute length (4 header + 8 value)
 	binary.BigEndian.PutUint32(resp[4:8], stunMagicCookie)
-	// transaction ID [8:20] left zero — the parser does not validate it.
+	if len(request) >= 20 {
+		copy(resp[8:20], request[8:20])
+	}
 	attr := resp[20:]
 	binary.BigEndian.PutUint16(attr[0:2], 0x0020) // XOR-MAPPED-ADDRESS
 	binary.BigEndian.PutUint16(attr[2:4], 8)
@@ -58,7 +61,7 @@ func startMockStunServer(t *testing.T) (*net.UDPAddr, func()) {
 				continue
 			}
 			if stun.IsStunMessage(buf[:n]) { // any STUN message -> reflect sender
-				_, _ = conn.WriteToUDP(mockStunBindingResponse(src), src)
+				_, _ = conn.WriteToUDP(mockStunBindingResponse(buf[:n], src), src)
 			}
 		}
 	}()
@@ -166,15 +169,15 @@ func TestServerStunDiscoveryAdvertisesEndpoint(t *testing.T) {
 	defer raw.Close()
 
 	_, parts, _ := handshakeRaw(t, raw, key)
-	if len(parts) < 4 {
-		t.Fatalf("expected a 4-field handshake payload, got %d fields: %q", len(parts), strings.Join(parts, "|"))
+	if len(parts) != 3 {
+		t.Fatalf("expected a 3-field handshake payload, got %d fields: %q", len(parts), strings.Join(parts, "|"))
 	}
 	// A local UPnP mapper may win the race with the mock STUN response in CI;
 	// either endpoint is valid as long as it is an address on the configured
 	// listener port and the field is not empty/forged text.
-	_, port, err := net.SplitHostPort(parts[3])
+	_, port, err := net.SplitHostPort(parts[2])
 	if err != nil || port != "28314" {
-		t.Fatalf("handshake 4th field = %q, want a valid endpoint on port 28314", parts[3])
+		t.Fatalf("handshake punch field = %q, want a valid endpoint on port 28314", parts[2])
 	}
 }
 
@@ -308,7 +311,7 @@ func TestPunchCandidateEstablishment(t *testing.T) {
 	relay := cli.candidates[0]
 	cli.candidateMu.RUnlock()
 	relay.mu.Lock()
-	relay.pathHint = "relay"
+	relay.pathClass = "relay"
 	relay.online = true
 	relay.mu.Unlock()
 
@@ -397,7 +400,7 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 
 	// 2. relay-only mode -> no punch candidate even with a relay.
 	c = mk("relay-only")
-	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", pathHint: "relay", online: true}}
+	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", pathClass: "relay", online: true}}
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 1 {
 		t.Fatalf("relay-only must not create a punch candidate")
@@ -407,7 +410,7 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 	// 3. An existing candidate at the same address -> skipped (redundant).
 	c = mk("auto")
 	dup, _ := net.ResolveUDPAddr("udp", target)
-	c.candidates = []*serverCandidate{{addrStr: target, udpAddr: dup, online: true, pathHint: "relay"}}
+	c.candidates = []*serverCandidate{{addrStr: target, udpAddr: dup, online: true, pathClass: "relay"}}
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 1 {
 		t.Fatalf("duplicate address must not create a second candidate")
@@ -417,12 +420,101 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 	// 4. A relay candidate at a different address -> punch candidate created.
 	c = mk("auto")
 	relayAddr, _ := net.ResolveUDPAddr("udp", "1.2.3.4:27014")
-	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", udpAddr: relayAddr, online: true, pathHint: "relay"}}
+	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", udpAddr: relayAddr, online: true, pathClass: "relay"}}
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 2 || !c.candidates[1].isPunch {
 		t.Fatalf("expected a punch candidate to be created, got %d candidates", len(c.candidates))
 	}
 	c.Stop()
+}
+
+func TestModeSwitchRetiresAndRestoresPunchCandidate(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	cfg.EnablePunch = true
+	cfg.StunServer = "127.0.0.1:9"
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+
+	relayAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 39991}
+	relay := &serverCandidate{
+		addrStr:       relayAddr.String(),
+		udpAddr:       relayAddr,
+		online:        true,
+		lastActive:    time.Now(),
+		rtt:           20 * time.Millisecond,
+		pathClass:     candidatePathRelay,
+		punchEndpoint: "127.0.0.1:39992",
+	}
+	punchConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	punchAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 39992}
+	punch := &serverCandidate{
+		addrStr:    punchAddr.String(),
+		udpAddr:    punchAddr,
+		conn:       punchConn,
+		sendTo:     punchAddr,
+		isPunch:    true,
+		online:     true,
+		lastActive: time.Now(),
+		rtt:        10 * time.Millisecond,
+		pathClass:  candidatePathPunch,
+	}
+	c.candidates = []*serverCandidate{relay, punch}
+	c.bestCandidate = punch
+
+	if err := c.SetMode("relay-only"); err != nil {
+		t.Fatal(err)
+	}
+	c.candidateMu.RLock()
+	if len(c.candidates) != 1 || c.candidates[0] != relay {
+		c.candidateMu.RUnlock()
+		t.Fatalf("relay-only candidates = %#v, want only relay", c.candidates)
+	}
+	c.candidateMu.RUnlock()
+
+	if err := c.SetMode("auto"); err != nil {
+		t.Fatal(err)
+	}
+	c.candidateMu.RLock()
+	restored := false
+	for _, cand := range c.candidates {
+		if cand != nil {
+			cand.mu.RLock()
+			isRestored := cand.isPunch && sameUDPAddr(cand.udpAddr, punchAddr)
+			cand.mu.RUnlock()
+			if isRestored {
+				restored = true
+				break
+			}
+		}
+	}
+	c.candidateMu.RUnlock()
+	if !restored {
+		t.Fatal("auto mode did not recreate the punch candidate cached by the relay")
+	}
+}
+
+func TestWaitPublicEndpointStopsForRetiredCandidate(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+
+	cand := &serverCandidate{retired: true}
+	started := time.Now()
+	if got := c.waitPublicEndpoint(cand, time.Second); got != "" {
+		t.Fatalf("public endpoint = %q, want empty for retired candidate", got)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("waitPublicEndpoint took %v for an already retired candidate", elapsed)
+	}
 }
 
 // TestPunchIsFallbackWhenRelayDies verifies the resilience story: while the
@@ -434,9 +526,9 @@ func TestPunchIsFallbackWhenRelayDies(t *testing.T) {
 	c := &Client{cfg: cfg}
 
 	relay := mkCand("157.148.128.243:18276", 52*time.Millisecond, true, false)
-	relay.pathHint = "relay"
+	relay.pathClass = "relay"
 	punch := mkCand("64.186.238.133:41465", 318*time.Millisecond, true, false)
-	punch.pathHint = "punch"
+	punch.pathClass = "punch"
 	punch.isPunch = true
 
 	c.candidates = []*serverCandidate{relay, punch}

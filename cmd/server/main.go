@@ -16,13 +16,12 @@ const Version = "1.0.0"
 
 func main() {
 	var (
-		configFile      string
-		listenAddr      string
-		targetAddr      string
-		proxyProtocolV2 bool
-		stunServer      string
-		punchAddr       string
-		showVersion     bool
+		configFile  string
+		listenAddr  string
+		targetAddr  string
+		stunServer  string
+		punchAddr   string
+		showVersion bool
 	)
 
 	flag.StringVar(&configFile, "c", "", "Path to YAML configuration file")
@@ -33,7 +32,6 @@ func main() {
 	flag.StringVar(&targetAddr, "target", "", "Upstream L4D2 server target override (e.g. 127.0.0.1:27015)")
 	flag.StringVar(&stunServer, "stun-server", "", "Public STUN server for discovering this server's public endpoint")
 	flag.StringVar(&punchAddr, "punch-addr", "", "Manual override for the public punch endpoint (ip:port); empty = STUN auto-discovery")
-	flag.BoolVar(&proxyProtocolV2, "proxy-protocol", false, "Enable PROXY protocol v1/v2 parsing from frp/HAProxy")
 	flag.BoolVar(&showVersion, "v", false, "Show version")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
 
@@ -60,9 +58,6 @@ func main() {
 	}
 	if setFlags["u"] || setFlags["target"] {
 		cfg.TargetAddr = targetAddr
-	}
-	if setFlags["proxy-protocol"] {
-		cfg.ProxyProtocolV2 = proxyProtocolV2
 	}
 	if setFlags["stun-server"] {
 		cfg.StunServer = stunServer

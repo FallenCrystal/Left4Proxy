@@ -84,10 +84,10 @@ func TestDualSendingDuringRouteMigration(t *testing.T) {
 	cli.sessionID.Store(clientSession.ID)
 
 	// Add punch candidate
-	punchCand, _ := cli.addCandidate(punchConn.LocalAddr().String())
+	punchCand, _ := cli.addCandidate(punchConn.LocalAddr().String(), candidatePathDirect)
 	punchCand.mu.Lock()
 	punchCand.online = true
-	punchCand.pathHint = "punch"
+	punchCand.pathClass = "punch"
 	punchCand.lastActive = time.Now()
 	punchCand.rtt = 10 * time.Millisecond
 	punchCand.mu.Unlock()
@@ -95,7 +95,7 @@ func TestDualSendingDuringRouteMigration(t *testing.T) {
 	relayCand := cli.candidates[0]
 	relayCand.mu.Lock()
 	relayCand.online = true
-	relayCand.pathHint = "relay"
+	relayCand.pathClass = "relay"
 	relayCand.lastActive = time.Now()
 	relayCand.rtt = 50 * time.Millisecond
 	relayCand.mu.Unlock()
@@ -172,7 +172,7 @@ func TestFastFailoverDuringActiveGameplay(t *testing.T) {
 		addrStr:    "127.0.0.1:39992",
 		udpAddr:    punchAddr,
 		isPunch:    true,
-		pathHint:   "punch",
+		pathClass:  "punch",
 		online:     true,
 		lastActive: time.Now().Add(-3 * time.Second), // 3s silent
 		rtt:        15 * time.Millisecond,
@@ -183,7 +183,7 @@ func TestFastFailoverDuringActiveGameplay(t *testing.T) {
 		addrStr:    "127.0.0.1:39991",
 		udpAddr:    relayAddr,
 		isPunch:    false,
-		pathHint:   "relay",
+		pathClass:  "relay",
 		online:     true,
 		lastActive: time.Now(), // active
 		rtt:        40 * time.Millisecond,

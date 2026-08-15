@@ -24,10 +24,10 @@ func newTestClient() *Client {
 	c.sessionID.Store(123456789)
 
 	c1 := mkCand("192.168.1.10:27014", 2*time.Millisecond, true, true)
-	c1.pathHint = "lan"
+	c1.pathClass = "lan"
 
 	c2 := mkCand("1.2.3.4:27014", 35*time.Millisecond, true, false)
-	c2.pathHint = "relay"
+	c2.pathClass = "relay"
 	c2.lastReflected = "114.240.1.2:45678"
 
 	c.candidates = []*serverCandidate{c1, c2}

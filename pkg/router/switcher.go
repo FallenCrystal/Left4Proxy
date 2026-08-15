@@ -9,6 +9,7 @@ import (
 type PathType string
 
 const (
+	PathNone   PathType = ""
 	PathLAN    PathType = "LAN"
 	PathDirect PathType = "Direct"
 	PathPunch  PathType = "Punch"
@@ -45,8 +46,9 @@ func NewRouter(mode string) *Router {
 			PathPunch:  {RTT: 999 * time.Millisecond, LossRate: 0, Active: false},
 			PathRelay:  {RTT: 999 * time.Millisecond, LossRate: 0, Active: true}, // Relay is always available as fallback
 		},
-		current: PathRelay,
+		current: PathNone,
 	}
+	r.evaluatePath()
 	return r
 }
 
@@ -119,13 +121,19 @@ func (r *Router) evaluatePath() {
 		switch {
 		case okPunch && stPunch.Active && (!okDir || !stDir.Active || stPunch.Score() <= stDir.Score()):
 			r.current = PathPunch
-		default:
+		case okDir && stDir.Active:
 			r.current = PathDirect
+		default:
+			r.current = PathNone
 		}
 		return
 
 	case "relay-only":
-		r.current = PathRelay
+		if stRelay, ok := r.stats[PathRelay]; ok && stRelay.Active {
+			r.current = PathRelay
+		} else {
+			r.current = PathNone
+		}
 		return
 
 	case "auto":
@@ -166,8 +174,14 @@ func (r *Router) evaluatePath() {
 			}
 		}
 
-		// Priority 3: Fallback to Server Relay
-		r.current = PathRelay
+		// Priority 3: Fallback to Server Relay. If the relay is also down, expose
+		// an empty path so callers can fail closed instead of displaying a route
+		// that cannot carry traffic.
+		if okRelay && stRelay.Active {
+			r.current = PathRelay
+		} else {
+			r.current = PathNone
+		}
 	}
 }
 

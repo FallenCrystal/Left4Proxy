@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"left4proxy/pkg/config"
+	"left4proxy/pkg/discover"
 	"left4proxy/pkg/protocol"
 	"left4proxy/pkg/router"
 	"left4proxy/pkg/security"
@@ -23,6 +25,20 @@ import (
 // its connection dropped). The game keeps sending heartbeats/timesync while
 // connected, so 30s is well beyond normal idle.
 const gameConnIdleTimeout = 30 * time.Second
+
+// A failed punch endpoint can be re-advertised by the server after a NAT
+// change. Bound retained sockets so repeated offers cannot consume an
+// unbounded number of file descriptors and reader goroutines.
+const maxPunchCandidates = 8
+const maxCandidates = 64
+const defaultServerPort = 27014
+
+const (
+	candidatePathLAN    = "lan"
+	candidatePathRelay  = "relay"
+	candidatePathPunch  = "punch"
+	candidatePathDirect = "direct"
+)
 
 type serverCandidate struct {
 	mu            sync.RWMutex
@@ -38,14 +54,18 @@ type serverCandidate struct {
 	isLAN         bool
 	online        bool
 	lastReflected string // Last STUN-reflected public endpoint, for deduped logging.
-	pathHint      string // Server's classification: "relay" | "direct" | "punch" | "lan".
+	pathClass     string // Trusted candidate provenance: "relay" | "direct" | "punch" | "lan".
 	punchEndpoint string // Authenticated server punch endpoint advertised in the handshake.
 	stunValidator *stun.Validator
+	retired       bool // Set before a failed punch socket is closed and removed.
 }
 
 // send writes data through the candidate's socket. Connected candidate sockets
 // use conn.Write; the unconnected punch socket uses WriteToUDP to sendTo.
 func (cand *serverCandidate) send(data []byte) error {
+	if cand == nil {
+		return fmt.Errorf("candidate is nil")
+	}
 	cand.mu.RLock()
 	conn := cand.conn
 	sendTo := cand.sendTo
@@ -85,13 +105,22 @@ type Client struct {
 	gameConnAddr     atomic.Pointer[net.UDPAddr] // Current game netchannel socket, for open/close logging.
 	gameConnLastSeen atomic.Int64                // UnixNano of the last packet from the game netchannel socket.
 	natInfo          atomic.Pointer[stun.NATMappingInfo]
+	natDetecting     atomic.Bool
+	natMu            sync.Mutex // Serializes explicit CLI NAT checks with background detection.
 	router           *router.Router
-	holePuncher      *stun.HolePuncher
+	holePuncher      atomic.Pointer[stun.HolePuncher]
 	lastReportedPath router.PathType
 	lastReportedCand string
 	ctx              context.Context
 	cancel           context.CancelFunc
-	wg               sync.WaitGroup
+	// startStopMu serializes the one-time socket setup with shutdown.  Without
+	// this second gate, Stop could observe nil while Start was still publishing a
+	// socket, then return before the newly-created loops were registered.
+	startStopMu sync.Mutex
+	lifecycleMu sync.Mutex
+	started     bool
+	stopping    bool
+	wg          sync.WaitGroup
 }
 
 // isA2SQuery reports whether a local payload is a Source Engine server query
@@ -134,12 +163,19 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.Mode = mode
+	// Own an immutable configuration snapshot. Callers often reuse the YAML
+	// struct for UI updates or wipe its key after construction; sharing its
+	// slices/pointer with the live data plane would create races and could erase
+	// the key while a handshake is in flight.
+	ownedCfg := *cfg
+	ownedCfg.Mode = mode
+	ownedCfg.ServerAddrs = append([]string(nil), cfg.ServerAddrs...)
+	ownedCfg.AuthKey = append([]byte(nil), cfg.AuthKey...)
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &Client{
-		cfg:              cfg,
-		authKey:          append([]byte(nil), cfg.AuthKey...),
-		router:           router.NewRouter(cfg.Mode),
+		cfg:              &ownedCfg,
+		authKey:          append([]byte(nil), ownedCfg.AuthKey...),
+		router:           router.NewRouter(mode),
 		lastReportedPath: "",
 		lastReportedCand: "",
 		ctx:              ctx,
@@ -147,6 +183,35 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 	}
 	client.mode.Store(mode)
 	return client, nil
+}
+
+// startTask registers a background goroutine under the lifecycle gate. Stop
+// closes this gate before waiting, preventing dynamic candidate callbacks from
+// adding WaitGroup work after Wait has started.
+func (s *Client) startTask(fn func()) bool {
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		return false
+	}
+	s.wg.Add(1)
+	s.lifecycleMu.Unlock()
+	go fn()
+	return true
+}
+
+func (s *Client) startTasks(count int) bool {
+	if count <= 0 {
+		return true
+	}
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		return false
+	}
+	s.wg.Add(count)
+	s.lifecycleMu.Unlock()
+	return true
 }
 
 func normalizeRouteMode(mode string) (string, error) {
@@ -178,17 +243,39 @@ func (s *Client) routeMode() string {
 
 // Start initializes local socket, connects to server candidates, and starts background loops.
 func (s *Client) Start() error {
+	s.startStopMu.Lock()
+	defer s.startStopMu.Unlock()
+
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		return fmt.Errorf("client is stopping or has already stopped")
+	}
+	if s.started {
+		s.lifecycleMu.Unlock()
+		return fmt.Errorf("client is already started")
+	}
+	s.started = true
+	s.lifecycleMu.Unlock()
+	rollbackStart := func() {
+		s.lifecycleMu.Lock()
+		s.started = false
+		s.lifecycleMu.Unlock()
+	}
 	if len(s.authKey) != security.KeySize {
+		rollbackStart()
 		return fmt.Errorf("client authentication key is missing or invalid; provision the shared .secret file before starting")
 	}
 	// 1. Bind local listener (default: 127.0.0.2:27015 - L4D2 loopback requirement)
 	localAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
 	if err != nil {
+		rollbackStart()
 		return fmt.Errorf("failed to resolve local listen addr %s: %w", s.cfg.ListenAddr, err)
 	}
 
 	lConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
+		rollbackStart()
 		return fmt.Errorf("failed to listen on local UDP %s: %w", s.cfg.ListenAddr, err)
 	}
 	s.localConn = lConn
@@ -196,20 +283,23 @@ func (s *Client) Start() error {
 	// 2. Resolve remote server external addresses/domains
 	addrs := s.cfg.GetServerAddrs()
 	for _, addrStr := range addrs {
-		s.addCandidate(addrStr)
+		s.addCandidate(addrStr, candidatePathRelay)
 	}
 
 	if len(s.candidates) == 0 {
 		_ = s.localConn.Close()
 		s.localConn = nil
+		rollbackStart()
 		return fmt.Errorf("no valid server candidates reachable from configured addrs: %v", addrs)
 	}
 
-	// Do not treat an unclassified candidate as an active route.  The server's
-	// authenticated handshake supplies the path hint; this is especially
-	// important for relay-only, which must fail closed until a real relay is
-	// identified.
+	// Do not send game data until a configured or authenticated candidate has
+	// completed the secure handshake.
+	s.candidateMu.Lock()
 	s.bestCandidate = nil
+	s.prevCandidate = nil
+	s.dualSendUntil = time.Time{}
+	s.candidateMu.Unlock()
 
 	// 3. Send initial Handshake across candidates
 	s.candidateMu.RLock()
@@ -230,15 +320,23 @@ func (s *Client) Start() error {
 		if interval <= 0 {
 			interval = 3 * time.Second
 		}
-		s.holePuncher = stun.NewHolePuncher(s.sessionID.Load(), cands[0].conn, nil)
-		s.holePuncher.SetSecureSender(s.sendHolePunchProbe)
-		s.holePuncher.StartPunching(interval)
+		holePuncher := stun.NewHolePuncher(s.sessionID.Load(), cands[0].conn, nil)
+		holePuncher.SetSecureSender(s.sendHolePunchProbe)
+		s.holePuncher.Store(holePuncher)
+		// Close the publication race with a handshake that completed between
+		// construction and Store. A later handshake also updates this value.
+		holePuncher.SetSessionID(s.sessionID.Load())
+		holePuncher.StartPunching(interval)
 		log.Printf("[Client] STUN hole-punching enabled -> candidate [%s] (interval %v)", cands[0].addrStr, interval)
 	} else {
 		log.Printf("[Client] STUN hole-punching disabled (enable_punch=%v)", s.cfg.EnablePunch)
 	}
 
-	s.wg.Add(3)
+	if !s.startTasks(3) {
+		_ = s.localConn.Close()
+		s.localConn = nil
+		return fmt.Errorf("client is stopping")
+	}
 	go s.localReadLoop()
 	go s.pingProbeLoop()
 	go s.detectNATLoop()
@@ -246,9 +344,34 @@ func (s *Client) Start() error {
 	return nil
 }
 
-// addCandidate resolves endpoint and adds a new candidate if not already tracked by IP:Port.
-func (s *Client) addCandidate(addrStr string) (*serverCandidate, bool) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addrStr)
+// addCandidate resolves an endpoint and records its trusted provenance. Client
+// configuration supplies relay entry points; the authenticated handshake
+// supplies direct server addresses.
+func (s *Client) addCandidate(addrStr, path string) (*serverCandidate, bool) {
+	normalized, err := discover.NormalizeEndpoint(addrStr, defaultServerPort)
+	if err != nil {
+		log.Printf("[Client] Ignoring invalid server endpoint %q: %v", addrStr, err)
+		return nil, false
+	}
+	addrStr = normalized
+	// Apply the hard cap before DNS resolution. Authenticated metadata can carry
+	// many hostnames, and resolving entries that cannot possibly be retained
+	// would let a bad configuration stall the client on unnecessary DNS work.
+	s.candidateMu.RLock()
+	for _, candidate := range s.candidates {
+		if candidate != nil && candidate.addrStr == addrStr {
+			s.setCandidatePath(candidate, path)
+			s.candidateMu.RUnlock()
+			return candidate, false
+		}
+	}
+	atLimit := len(s.candidates) >= maxCandidates
+	s.candidateMu.RUnlock()
+	if atLimit {
+		log.Printf("[Client] Candidate limit reached (%d); ignoring endpoint [%s]", maxCandidates, addrStr)
+		return nil, false
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", normalized)
 	if err != nil {
 		return nil, false
 	}
@@ -258,9 +381,17 @@ func (s *Client) addCandidate(addrStr string) (*serverCandidate, bool) {
 
 	// Deduplicate by resolved IP:Port rather than input domain string!
 	for _, c := range s.candidates {
+		if c == nil || c.udpAddr == nil {
+			continue
+		}
 		if c.udpAddr.String() == udpAddr.String() {
+			s.setCandidatePath(c, path)
 			return c, false
 		}
+	}
+	if len(s.candidates) >= maxCandidates {
+		log.Printf("[Client] Candidate limit reached (%d); ignoring endpoint [%s]", maxCandidates, addrStr)
+		return nil, false
 	}
 
 	conn, err := net.DialUDP("udp", nil, udpAddr)
@@ -279,13 +410,45 @@ func (s *Client) addCandidate(addrStr string) (*serverCandidate, bool) {
 		rtt:     999 * time.Millisecond,
 		isLAN:   isLAN,
 	}
+	s.setCandidatePath(cand, path)
 	s.candidates = append(s.candidates, cand)
 
-	s.wg.Add(1)
-	go s.candidateReadLoop(cand)
+	if !s.startTask(func() { s.candidateReadLoop(cand) }) {
+		_ = conn.Close()
+		s.candidates = s.candidates[:len(s.candidates)-1]
+		return nil, false
+	}
 
-	log.Printf("[Client] Discovered Candidate Endpoint: [%s] (IP: %s, LAN: %v)", addrStr, udpAddr.String(), cand.isLAN)
+	cand.mu.RLock()
+	candidatePath := cand.pathClass
+	cand.mu.RUnlock()
+	log.Printf("[Client] Discovered Candidate Endpoint: [%s] (IP: %s, Path: %s)", addrStr, udpAddr.String(), candidatePath)
 	return cand, true
+}
+
+func (s *Client) setCandidatePath(cand *serverCandidate, path string) {
+	if cand == nil {
+		return
+	}
+	cand.mu.Lock()
+	defer cand.mu.Unlock()
+	if cand.isPunch {
+		cand.pathClass = candidatePathPunch
+		return
+	}
+	if path == candidatePathDirect && cand.isLAN {
+		path = candidatePathLAN
+	}
+	switch path {
+	case candidatePathLAN, candidatePathDirect:
+		// An authenticated advertised address is more specific than the relay
+		// role assigned to an initial entry point, so it may promote a duplicate.
+		cand.pathClass = path
+	case candidatePathRelay:
+		if cand.pathClass == "" || cand.pathClass == candidatePathRelay {
+			cand.pathClass = path
+		}
+	}
 }
 
 // maybeCreatePunchCandidate establishes a STUN hole-punched direct candidate
@@ -297,13 +460,16 @@ func (s *Client) maybeCreatePunchCandidate(serverPublic string) {
 		return
 	}
 	addr, err := net.ResolveUDPAddr("udp", serverPublic)
-	if err != nil {
+	if err != nil || addr == nil || addr.IP == nil || addr.Port < 1 || addr.Port > 65535 {
 		log.Printf("[Client] Ignoring invalid punch endpoint %q: %v", serverPublic, err)
 		return
 	}
 
 	s.candidateMu.RLock()
 	for _, c := range s.candidates {
+		if c == nil || c.udpAddr == nil {
+			continue
+		}
 		if c.udpAddr.IP.Equal(addr.IP) && c.udpAddr.Port == addr.Port {
 			s.candidateMu.RUnlock()
 			return // already have this endpoint (e.g. a direct / port-forwarded candidate)
@@ -311,10 +477,13 @@ func (s *Client) maybeCreatePunchCandidate(serverPublic string) {
 	}
 	hasRelay := false
 	for _, c := range s.candidates {
+		if c == nil {
+			continue
+		}
 		c.mu.RLock()
-		hint := c.pathHint
+		hint, online := c.pathClass, c.online
 		c.mu.RUnlock()
-		if hint == protocol.PathHintRelay {
+		if hint == candidatePathRelay && online {
 			hasRelay = true
 			break
 		}
@@ -330,6 +499,10 @@ func (s *Client) maybeCreatePunchCandidate(serverPublic string) {
 // addPunchCandidate creates the unconnected punch socket toward the server's
 // public endpoint and starts its read loop and establishment goroutine.
 func (s *Client) addPunchCandidate(serverPublic *net.UDPAddr) {
+	if serverPublic == nil || s.routeMode() == "relay-only" {
+		return
+	}
+	serverPublic = cloneUDPAddr(serverPublic)
 	// Unconnected socket: it must talk to BOTH the public STUN server (to learn
 	// this socket's NAT-mapped endpoint) and the server's public endpoint
 	// (probes and, after migration, data).
@@ -345,17 +518,63 @@ func (s *Client) addPunchCandidate(serverPublic *net.UDPAddr) {
 		sendTo:        serverPublic,
 		isPunch:       true,
 		rtt:           999 * time.Millisecond,
-		pathHint:      "punch",
+		pathClass:     candidatePathPunch,
 		stunValidator: stun.NewValidator(),
 	}
 	s.candidateMu.Lock()
+	// maybeCreatePunchCandidate performs a pre-check for cheap gating, but the
+	// check and append must be repeated while holding the write lock: handshake
+	// responses and push offers can arrive concurrently.
+	if s.routeMode() == "relay-only" {
+		s.candidateMu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	if len(s.candidates) >= maxCandidates {
+		s.candidateMu.Unlock()
+		_ = conn.Close()
+		log.Printf("[Client] Candidate limit reached (%d); ignoring punch endpoint [%s]", maxCandidates, serverPublic)
+		return
+	}
+	punchCount := 0
+	for _, existing := range s.candidates {
+		if existing == nil {
+			continue
+		}
+		existing.mu.RLock()
+		existingPunch := existing.isPunch
+		existingAddr := existing.udpAddr
+		existing.mu.RUnlock()
+		if existingPunch {
+			punchCount++
+		}
+		// A normal connected relay/direct candidate and an unconnected punch
+		// candidate may intentionally share the same destination address: they
+		// use different local sockets and therefore different NAT mappings. Only
+		// suppress duplicate punch sockets.
+		if existingPunch && existingAddr != nil && sameUDPAddr(existingAddr, serverPublic) {
+			s.candidateMu.Unlock()
+			_ = conn.Close()
+			return
+		}
+	}
+	if punchCount >= maxPunchCandidates {
+		s.candidateMu.Unlock()
+		_ = conn.Close()
+		log.Printf("[Client] Punch candidate limit reached (%d); ignoring endpoint [%s]", maxPunchCandidates, serverPublic)
+		return
+	}
 	s.candidates = append(s.candidates, cand)
 	s.candidateMu.Unlock()
 
-	s.wg.Add(1)
-	go s.candidateReadLoop(cand)
-	s.wg.Add(1)
-	go s.establishPunch(cand)
+	if !s.startTask(func() { s.candidateReadLoop(cand) }) {
+		s.punchFailed(cand)
+		return
+	}
+	if !s.startTask(func() { s.establishPunch(cand) }) {
+		s.punchFailed(cand)
+		return
+	}
 
 	log.Printf("[Client] Punch candidate created -> direct endpoint [%s] (socket %s)", serverPublic, conn.LocalAddr())
 }
@@ -367,11 +586,40 @@ func (s *Client) relayCandidate() *serverCandidate {
 	s.candidateMu.RLock()
 	defer s.candidateMu.RUnlock()
 	for _, c := range s.candidates {
+		if c == nil {
+			continue
+		}
 		c.mu.RLock()
-		hint := c.pathHint
+		hint := c.pathClass
 		online := c.online
 		c.mu.RUnlock()
-		if hint == protocol.PathHintRelay && online {
+		if hint == candidatePathRelay && online {
+			return c
+		}
+	}
+	return nil
+}
+
+// punchControlCandidate returns an authenticated non-punch socket suitable for
+// carrying PunchInit. Relay is preferred, but a local integration path can be
+// reclassified as LAN/Direct by the next authenticated Pong while a punch
+// attempt is already in flight. Any still-online non-punch socket is a valid
+// control channel in that case; the server binds the requested target only
+// after validating the AEAD session.
+func (s *Client) punchControlCandidate() *serverCandidate {
+	if relay := s.relayCandidate(); relay != nil {
+		return relay
+	}
+	s.candidateMu.RLock()
+	defer s.candidateMu.RUnlock()
+	for _, c := range s.candidates {
+		if c == nil {
+			continue
+		}
+		c.mu.RLock()
+		isPunch, online := c.isPunch, c.online
+		c.mu.RUnlock()
+		if !isPunch && online {
 			return c
 		}
 	}
@@ -384,7 +632,7 @@ func (s *Client) sendPunchInit(cand *serverCandidate, cDirect string) {
 	if s.routeMode() == "relay-only" {
 		return
 	}
-	relay := s.relayCandidate()
+	relay := s.punchControlCandidate()
 	if relay == nil {
 		return
 	}
@@ -425,8 +673,11 @@ func (s *Client) sendSecureProbeBurst(cand *serverCandidate, count int, interval
 		data, err := s.sealClientPacket(protocol.CmdStunProbe, []byte("PUNCH"))
 		if err == nil {
 			cand.mu.RLock()
-			conn, target := cand.conn, cand.sendTo
+			conn, target, retired := cand.conn, cand.sendTo, cand.retired
 			cand.mu.RUnlock()
+			if retired {
+				return
+			}
 			if conn != nil && target != nil {
 				_, _ = conn.WriteToUDP(data, target)
 			}
@@ -459,6 +710,9 @@ func (s *Client) sendHolePunchProbe() error {
 // waitPublicEndpoint blocks until the punch socket learns its public endpoint
 // via STUN reflection (or the timeout elapses).
 func (s *Client) waitPublicEndpoint(cand *serverCandidate, timeout time.Duration) string {
+	if cand == nil {
+		return ""
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -467,8 +721,11 @@ func (s *Client) waitPublicEndpoint(cand *serverCandidate, timeout time.Duration
 		default:
 		}
 		cand.mu.RLock()
-		pe := cand.pubEndpoint
+		pe, retired := cand.pubEndpoint, cand.retired
 		cand.mu.RUnlock()
+		if retired {
+			return ""
+		}
 		if pe != "" {
 			return pe
 		}
@@ -484,6 +741,7 @@ func (s *Client) waitPublicEndpoint(cand *serverCandidate, timeout time.Duration
 func (s *Client) establishPunch(cand *serverCandidate) {
 	defer s.wg.Done()
 	if s.routeMode() == "relay-only" {
+		s.retirePunchCandidate(cand, "aborted because route mode is relay-only")
 		return
 	}
 
@@ -512,14 +770,23 @@ func (s *Client) establishPunch(cand *serverCandidate) {
 	}
 
 	// 1. Discover C_direct on the punch socket via parallel multi-STUN racing.
+	cand.mu.Lock()
 	if cand.stunValidator == nil {
 		cand.stunValidator = stun.NewValidator()
 	}
+	validator := cand.stunValidator
+	conn := cand.conn
+	cand.mu.Unlock()
+	if conn == nil {
+		s.punchFailed(cand)
+		return
+	}
 	for i := 0; i < 2; i++ {
 		if s.routeMode() == "relay-only" {
+			s.retirePunchCandidate(cand, "aborted because route mode is relay-only")
 			return
 		}
-		_ = cand.stunValidator.SendMultiBindingRequests(cand.conn, stunAddrs)
+		_ = validator.SendMultiBindingRequests(conn, stunAddrs)
 		time.Sleep(20 * time.Millisecond)
 	}
 	cDirect := s.waitPublicEndpoint(cand, 2*time.Second)
@@ -530,17 +797,14 @@ func (s *Client) establishPunch(cand *serverCandidate) {
 	}
 
 	// 2. Probe the server's public endpoint until confirmed or timed out.
-	cand.mu.RLock()
-	sendTo := cand.sendTo
-	cand.mu.RUnlock()
-
 	// Immediately send an initial authenticated burst to establish the client
 	// NAT mapping within ~100ms.
-	s.wg.Add(1)
-	go func() {
+	if !s.startTask(func() {
 		defer s.wg.Done()
 		s.sendSecureProbeBurst(cand, 5, 25*time.Millisecond)
-	}()
+	}) {
+		return
+	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
@@ -549,19 +813,21 @@ func (s *Client) establishPunch(cand *serverCandidate) {
 		default:
 		}
 		if s.routeMode() == "relay-only" {
-			cand.mu.Lock()
-			cand.online = false
-			cand.mu.Unlock()
+			s.retirePunchCandidate(cand, "aborted because route mode is relay-only")
 			return
 		}
 		if data, err := s.sealClientPacket(protocol.CmdStunProbe, []byte("PUNCH")); err == nil {
-			_, _ = cand.conn.WriteToUDP(data, sendTo)
+			_ = cand.send(data)
 		}
 
 		cand.mu.RLock()
 		online := cand.online
 		reflected := cand.lastReflected
+		retired := cand.retired
 		cand.mu.RUnlock()
+		if retired {
+			return
+		}
 
 		if online {
 			log.Printf("[Client] Punch path confirmed -> direct endpoint [%s] (socket %s)", cand.udpAddr, cand.conn.LocalAddr())
@@ -569,11 +835,10 @@ func (s *Client) establishPunch(cand *serverCandidate) {
 			// One-shot diagnostic: once the ping loop has measured the punch
 			// candidate's RTT, report how it compares to the current best so it's
 			// obvious whether the direct path won or why it didn't.
-			s.wg.Add(1)
-			go func() {
+			s.startTask(func() {
 				defer s.wg.Done()
 				s.logPunchRttDiagnostic(cand)
-			}()
+			})
 			return
 		}
 		// The server reflected our probe (its NAT was open enough) — now we know
@@ -589,10 +854,57 @@ func (s *Client) establishPunch(cand *serverCandidate) {
 
 // punchFailed marks the punch candidate dead (relay stays the active path).
 func (s *Client) punchFailed(cand *serverCandidate) {
+	s.retirePunchCandidate(cand, "failed (no direct path), staying on relay")
+}
+
+func (s *Client) retirePunchCandidate(cand *serverCandidate, reason string) {
+	if cand == nil {
+		return
+	}
 	cand.mu.Lock()
+	if cand.retired {
+		cand.mu.Unlock()
+		return
+	}
 	cand.online = false
+	cand.retired = true
+	conn := cand.conn
 	cand.mu.Unlock()
-	log.Printf("[Client] Punch to [%s] failed (no direct path), staying on relay", cand.addrStr)
+	if conn != nil {
+		// Closing the socket wakes candidateReadLoop immediately. The pointer is
+		// intentionally retained until the goroutine exits; setting it to nil
+		// would race with the reader's ReadFromUDP call.
+		_ = conn.Close()
+	}
+	s.removeCandidate(cand)
+	if reason != "" {
+		log.Printf("[Client] Punch candidate [%s] %s", cand.addrStr, reason)
+	}
+}
+
+func (s *Client) removeCandidate(target *serverCandidate) {
+	if target == nil {
+		return
+	}
+	s.candidateMu.Lock()
+	for i, cand := range s.candidates {
+		if cand != target {
+			continue
+		}
+		s.candidates = append(s.candidates[:i], s.candidates[i+1:]...)
+		if s.bestCandidate == target {
+			s.bestCandidate = nil
+		}
+		if s.prevCandidate == target {
+			s.prevCandidate = nil
+			s.dualSendUntil = time.Time{}
+		}
+		break
+	}
+	s.candidateMu.Unlock()
+	// Re-evaluate the route after removal so a healthy relay can become active
+	// immediately instead of waiting for the next ping tick.
+	s.selectBestCandidate()
 }
 
 // logPunchRttDiagnostic waits (up to ~6s) for the punch candidate's RTT to be
@@ -601,6 +913,9 @@ func (s *Client) punchFailed(cand *serverCandidate) {
 // latency — visible, so a human can tell "direct is genuinely slower" apart
 // from "RTT was never measured".
 func (s *Client) logPunchRttDiagnostic(cand *serverCandidate) {
+	if cand == nil {
+		return
+	}
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
@@ -609,8 +924,11 @@ func (s *Client) logPunchRttDiagnostic(cand *serverCandidate) {
 		default:
 		}
 		cand.mu.RLock()
-		punchRTT := cand.rtt
+		punchRTT, retired := cand.rtt, cand.retired
 		cand.mu.RUnlock()
+		if retired {
+			return
+		}
 		if punchRTT < 999*time.Millisecond {
 			break
 		}
@@ -678,13 +996,14 @@ func (s *Client) sendHandshake(cand *serverCandidate) {
 	_ = cand.send(data)
 }
 
-// pathForCandidate maps a candidate to the path type from the server's
-// authenticated Ping/Pong classification. Destination shape is used only for
-// an unclassified status display; candidate admission still fails closed.
+// pathForCandidate maps trusted candidate provenance to the routing tier.
 func (s *Client) pathForCandidate(cand *serverCandidate) router.PathType {
+	if cand == nil {
+		return router.PathNone
+	}
 	cand.mu.RLock()
 	isLAN := cand.isLAN
-	hint := cand.pathHint
+	hint := cand.pathClass
 	isPunch := cand.isPunch
 	cand.mu.RUnlock()
 	return pathForCandidateValues(isLAN, hint, isPunch)
@@ -692,13 +1011,13 @@ func (s *Client) pathForCandidate(cand *serverCandidate) router.PathType {
 
 func pathForCandidateValues(isLAN bool, hint string, isPunch bool) router.PathType {
 	switch hint {
-	case protocol.PathHintRelay:
+	case candidatePathRelay:
 		return router.PathRelay
-	case protocol.PathHintPunch:
+	case candidatePathPunch:
 		return router.PathPunch
-	case protocol.PathHintDirect:
+	case candidatePathDirect:
 		return router.PathDirect
-	case protocol.PathHintLAN:
+	case candidatePathLAN:
 		return router.PathLAN
 	default:
 		if isPunch {
@@ -707,8 +1026,8 @@ func pathForCandidateValues(isLAN bool, hint string, isPunch bool) router.PathTy
 		if isLAN {
 			return router.PathLAN
 		}
-		// Unknown candidates are displayed as Relay for compatibility, but
-		// candidateAllowedValues fails closed until a verified hint arrives.
+		// Unknown candidates are displayed as Relay for compatibility, but are
+		// not admitted to the data path.
 		return router.PathRelay
 	}
 }
@@ -718,7 +1037,7 @@ func (s *Client) candidateAllowed(cand *serverCandidate) bool {
 		return false
 	}
 	cand.mu.RLock()
-	isLAN, hint, isPunch := cand.isLAN, cand.pathHint, cand.isPunch
+	isLAN, hint, isPunch := cand.isLAN, cand.pathClass, cand.isPunch
 	cand.mu.RUnlock()
 	return s.candidateAllowedValues(isLAN, hint, isPunch)
 }
@@ -729,25 +1048,24 @@ func (s *Client) candidateAllowedValues(isLAN bool, hint string, isPunch bool) b
 	if s != nil && s.cfg != nil {
 		enableLAN = s.cfg.EnableLAN
 	}
-	// The authenticated server hint is authoritative. Destination address
-	// shape is not: a local address can front a relay tunnel, and a public
-	// address can still be a direct path.
+	// Provenance is authoritative. Address shape alone is ambiguous because a
+	// local endpoint can still front a relay process.
 	switch mode {
 	case "relay-only":
-		return !isPunch && hint == protocol.PathHintRelay
+		return !isPunch && hint == candidatePathRelay
 	case "direct-only":
-		if hint == "" || hint == protocol.PathHintRelay {
+		if hint == "" || hint == candidatePathRelay {
 			return false
 		}
-		if hint == protocol.PathHintLAN {
+		if hint == candidatePathLAN {
 			return enableLAN
 		}
-		return hint == protocol.PathHintDirect || hint == protocol.PathHintPunch
+		return hint == candidatePathDirect || hint == candidatePathPunch
 	default:
 		switch hint {
-		case protocol.PathHintLAN:
+		case candidatePathLAN:
 			return enableLAN
-		case protocol.PathHintRelay, protocol.PathHintDirect, protocol.PathHintPunch:
+		case candidatePathRelay, candidatePathDirect, candidatePathPunch:
 			return true
 		default:
 			return false
@@ -766,24 +1084,28 @@ func (s *Client) selectBestCandidate() {
 	now := time.Now()
 
 	for _, cand := range s.candidates {
+		if cand == nil {
+			continue
+		}
 		cand.mu.RLock()
 		lastActive := cand.lastActive
 		online := cand.online
 		rtt := cand.rtt
 		isLAN := cand.isLAN
-		pathHint := cand.pathHint
+		pathClass := cand.pathClass
 		isPunch := cand.isPunch
 		cand.mu.RUnlock()
+		lanCandidate := pathClass == candidatePathLAN
 
 		// Apply the routing mode to the actual candidate, not just to the display
 		// router. In particular relay-only excludes every non-relay candidate.
-		if !s.candidateAllowedValues(isLAN, pathHint, isPunch) {
+		if !s.candidateAllowedValues(isLAN, pathClass, isPunch) {
 			continue
 		}
 
 		if online && !lastActive.IsZero() && now.Sub(lastActive) <= 15*time.Second {
 			effRTT := rtt
-			if isLAN {
+			if lanCandidate {
 				effRTT = effRTT / 10 // Strongly favor LAN candidates
 			}
 			if best == nil || effRTT < bestEffectiveRTT {
@@ -794,11 +1116,13 @@ func (s *Client) selectBestCandidate() {
 	}
 
 	if best == nil {
-		if s.routeMode() == "relay-only" {
-			s.bestCandidate = nil
-			s.prevCandidate = nil
-			s.dualSendUntil = time.Time{}
-		}
+		// No candidate satisfies the current mode and liveness window. Keep the
+		// data plane fail-closed in every mode; retaining a stale best candidate
+		// here would continue sending game packets over a route that the selector
+		// has already deemed unavailable.
+		s.bestCandidate = nil
+		s.prevCandidate = nil
+		s.dualSendUntil = time.Time{}
 		return
 	}
 
@@ -811,13 +1135,13 @@ func (s *Client) selectBestCandidate() {
 		if s.bestCandidate != nil {
 			s.bestCandidate.mu.RLock()
 			currRTT := s.bestCandidate.rtt
-			currLAN := s.bestCandidate.isLAN
+			currLAN := s.bestCandidate.pathClass == candidatePathLAN
 			currOnline := s.bestCandidate.online
 			currLastActive := s.bestCandidate.lastActive
 			s.bestCandidate.mu.RUnlock()
 
 			best.mu.RLock()
-			bestLAN := best.isLAN
+			bestLAN := best.pathClass == candidatePathLAN
 			bestRTT := best.rtt
 			best.mu.RUnlock()
 
@@ -840,7 +1164,13 @@ func (s *Client) selectBestCandidate() {
 
 		oldBest := s.bestCandidate
 		s.bestCandidate = best
-		if oldBest != nil && oldBest.online && oldBest != best && s.candidateAllowed(oldBest) && s.candidateAllowed(best) {
+		oldBestOnline := false
+		if oldBest != nil {
+			oldBest.mu.RLock()
+			oldBestOnline = oldBest.online
+			oldBest.mu.RUnlock()
+		}
+		if oldBest != nil && oldBestOnline && oldBest != best && s.candidateAllowed(oldBest) && s.candidateAllowed(best) {
 			s.prevCandidate = oldBest
 			s.dualSendUntil = time.Now().Add(400 * time.Millisecond)
 			log.Printf("[Client] Route migration: Dual-sending to [%s] and [%s] for 400ms (0-RTT handoff)", best.addrStr, oldBest.addrStr)
@@ -848,16 +1178,16 @@ func (s *Client) selectBestCandidate() {
 
 		best.mu.RLock()
 		bestRTT := best.rtt
-		bestLAN := best.isLAN
+		bestLAN := best.pathClass == candidatePathLAN
 		best.mu.RUnlock()
 
 		// Keep the hole puncher following the active candidate, so STUN keepalives
 		// keep the NAT mapping of the path that actually carries data alive.
-		if s.cfg.EnablePunch && s.routeMode() != "relay-only" && s.holePuncher != nil {
+		if holePuncher := s.holePuncher.Load(); s.cfg.EnablePunch && s.routeMode() != "relay-only" && holePuncher != nil {
 			best.mu.RLock()
 			bestSendTo := best.sendTo
 			best.mu.RUnlock()
-			s.holePuncher.Retarget(best.conn, bestSendTo)
+			holePuncher.Retarget(best.conn, bestSendTo)
 			log.Printf("[Client] STUN hole-puncher retargeted -> candidate [%s]", best.addrStr)
 		}
 
@@ -969,6 +1299,15 @@ func (s *Client) checkGameConnectionClosed() {
 // candidateReadLoop is the SOLE reader for a candidate UDP socket.
 func (s *Client) candidateReadLoop(cand *serverCandidate) {
 	defer s.wg.Done()
+	if cand == nil {
+		return
+	}
+	cand.mu.RLock()
+	conn := cand.conn
+	cand.mu.RUnlock()
+	if conn == nil {
+		return
+	}
 	buf := make([]byte, 65535)
 
 	for {
@@ -978,8 +1317,8 @@ func (s *Client) candidateReadLoop(cand *serverCandidate) {
 		default:
 		}
 
-		_ = cand.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, src, err := cand.conn.ReadFromUDP(buf)
+		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
@@ -994,7 +1333,7 @@ func (s *Client) candidateReadLoop(cand *serverCandidate) {
 				return
 			default:
 			}
-			if strings.Contains(err.Error(), "use of closed network connection") {
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -1005,8 +1344,13 @@ func (s *Client) candidateReadLoop(cand *serverCandidate) {
 
 		// STUN responses are accepted only through the punch socket's pending
 		// transaction validator.  A forged magic-cookie packet is discarded.
-		if cand.stunValidator != nil {
-			if validated, verr := cand.stunValidator.Accept(data, src); verr == nil {
+		cand.mu.RLock()
+		validator := cand.stunValidator
+		isPunch := cand.isPunch
+		udpAddr := cand.udpAddr
+		cand.mu.RUnlock()
+		if validator != nil {
+			if validated, verr := validator.Accept(data, src); verr == nil {
 				addr := validated.Reflected
 				cand.mu.Lock()
 				if cand.pubEndpoint == "" || cand.pubEndpoint != addr.String() {
@@ -1039,7 +1383,7 @@ func (s *Client) candidateReadLoop(cand *serverCandidate) {
 		// Otherwise a captured valid ciphertext sent by an unexpected peer could
 		// consume the replay-window slot and make the legitimate packet look like
 		// a replay when it arrives on the correct path.
-		if cand.isPunch && (cand.udpAddr == nil || !sameUDPAddr(src, cand.udpAddr)) {
+		if isPunch && (udpAddr == nil || !sameUDPAddr(src, udpAddr)) {
 			continue
 		}
 		opened, err := sess.Open(data, security.ServerToClient)
@@ -1098,18 +1442,25 @@ func (s *Client) handleHandshakeResponse(cand *serverCandidate, pkt *protocol.Pa
 		session.Close()
 	}
 	s.sessionMu.Unlock()
+	if holePuncher := s.holePuncher.Load(); holePuncher != nil {
+		holePuncher.SetSessionID(response.SessionID)
+	}
 
 	// Use the session selected by the first valid response for all candidates;
 	// the server accepts that authenticated session on each address learned from
 	// the same handshake, which keeps route migration on one upstream socket.
+	handshakeRTT := time.Duration(time.Now().UnixNano() - pkt.Timestamp)
+	if handshakeRTT <= 0 || handshakeRTT > 10*time.Second {
+		handshakeRTT = 999 * time.Millisecond
+	}
 	cand.mu.Lock()
 	cand.lastActive = time.Now()
 	cand.online = true
-	cand.rtt = time.Duration(time.Now().UnixNano() - pkt.Timestamp)
+	cand.rtt = handshakeRTT
 	candRTT := cand.rtt
-	parts := strings.Split(string(response.Metadata), "|")
-	if len(parts) > 3 {
-		cand.punchEndpoint = parts[3]
+	parts := strings.SplitN(string(response.Metadata), "|", 3)
+	if len(parts) > 2 {
+		cand.punchEndpoint = parts[2]
 	}
 	cand.mu.Unlock()
 
@@ -1123,17 +1474,14 @@ func (s *Client) handleHandshakeResponse(cand *serverCandidate, pkt *protocol.Pa
 		for _, advAddr := range strings.Split(parts[1], ",") {
 			advAddr = strings.TrimSpace(advAddr)
 			if advAddr != "" {
-				newCand, isNew := s.addCandidate(advAddr)
+				newCand, isNew := s.addCandidate(advAddr, candidatePathDirect)
 				if isNew && newCand != nil {
 					s.sendHandshake(newCand)
 				}
 			}
 		}
 	}
-	// Bind this candidate to the server with a fresh authenticated ping. The
-	// corresponding Pong carries the path classification for this exact source
-	// address; handshake metadata is shared across candidates and is not used for
-	// relay-only admission.
+	// Bind this candidate source to the shared session and obtain a fresh RTT.
 	if data, pingErr := s.sealClientPacket(protocol.CmdPing, []byte("PING")); pingErr == nil {
 		_ = cand.send(data)
 	}
@@ -1175,41 +1523,19 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		return
 
 	case protocol.CmdPong:
-		hint, validHint := protocol.DecodePathHint(pkt.Payload)
-		punchEndpoint := ""
-		if validHint {
-			cand.mu.Lock()
-			cand.pathHint = hint
-			punchEndpoint = cand.punchEndpoint
-			cand.mu.Unlock()
-		} else {
-			// A malformed/legacy authenticated Pong must not leave a stale
-			// Relay label active in relay-only mode.
-			cand.mu.Lock()
-			cand.pathHint = ""
-			cand.mu.Unlock()
+		if string(pkt.Payload) != "PONG" {
+			return
 		}
 		cand.mu.RLock()
 		candRTT := cand.rtt
+		path := cand.pathClass
+		punchEndpoint := cand.punchEndpoint
 		cand.mu.RUnlock()
 
-		if validHint {
-			s.router.UpdateMetrics(s.pathForCandidate(cand), candRTT, 0.0)
-			if punchEndpoint != "" && hint == protocol.PathHintRelay {
-				// The handshake response can be shared by several candidate
-				// sockets, so wait until this socket's authenticated Pong marks
-				// it as Relay before enabling punch negotiation.
-				s.maybeCreatePunchCandidate(punchEndpoint)
-			}
+		s.router.UpdateMetrics(s.pathForCandidate(cand), candRTT, 0.0)
+		if punchEndpoint != "" && path == candidatePathRelay {
+			s.maybeCreatePunchCandidate(punchEndpoint)
 		}
-		s.selectBestCandidate()
-
-	case protocol.CmdLanAck:
-		cand.mu.Lock()
-		cand.rtt = 1 * time.Millisecond
-		cand.isLAN = true
-		cand.mu.Unlock()
-		s.router.UpdateMetrics(router.PathLAN, 1*time.Millisecond, 0.0)
 		s.selectBestCandidate()
 
 	case protocol.CmdStunAck:
@@ -1246,7 +1572,10 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 
 	case protocol.CmdPunchAck:
 		// Server confirmed it received our PunchInit and is probing toward us.
-		if !cand.isPunch {
+		cand.mu.RLock()
+		isPunch := cand.isPunch
+		cand.mu.RUnlock()
+		if !isPunch {
 			log.Printf("[Client] Server acknowledged punch init (candidate %s)", cand.addrStr)
 		}
 
@@ -1305,10 +1634,13 @@ func (s *Client) pingProbeLoop() {
 			now := time.Now()
 
 			for _, cand := range cands {
+				if cand == nil {
+					continue
+				}
 				allowed := s.candidateAllowed(cand)
 				cand.mu.RLock()
 				isPunch := cand.isPunch
-				hint := cand.pathHint
+				hint := cand.pathClass
 				lastActive := cand.lastActive
 				cand.mu.RUnlock()
 				if !lastActive.IsZero() && now.Sub(lastActive) <= 15*time.Second {
@@ -1370,7 +1702,12 @@ func (s *Client) pingProbeLoop() {
 			s.selectBestCandidate()
 
 			if !anyOnline {
+				// Clear every route class, including direct-tier metrics. Otherwise
+				// Router can continue reporting a stale Direct/Punch path even though
+				// the candidate selector has established that no socket is live.
 				s.router.SetInactive(router.PathLAN)
+				s.router.SetInactive(router.PathDirect)
+				s.router.SetInactive(router.PathPunch)
 				s.router.SetInactive(router.PathRelay)
 
 				if s.lastReportedCand != "OFFLINE" {
@@ -1400,10 +1737,15 @@ func (s *Client) pingProbeLoop() {
 			bestCand := s.bestCandidate
 			s.candidateMu.RUnlock()
 
-			curPath := s.router.CurrentPath()
+			curPath := router.PathNone
 			candKey := ""
 			if bestCand != nil {
-				candKey = bestCand.udpAddr.String()
+				bestCand.mu.RLock()
+				if bestCand.udpAddr != nil {
+					candKey = bestCand.udpAddr.String()
+				}
+				curPath = pathForCandidateValues(bestCand.isLAN, bestCand.pathClass, bestCand.isPunch)
+				bestCand.mu.RUnlock()
 			}
 
 			// ONLY log when the active candidate IP:Port OR route mode ACTUALLY changes!
@@ -1427,6 +1769,9 @@ func (s *Client) resetSecureSessionForReconnect() {
 		s.secureSession.Store(nil)
 	}
 	s.sessionID.Store(0)
+	if holePuncher := s.holePuncher.Load(); holePuncher != nil {
+		holePuncher.SetSessionID(0)
+	}
 	s.acceptedHSSeq = 0
 	s.sessionMu.Unlock()
 
@@ -1441,9 +1786,22 @@ func (s *Client) resetSecureSessionForReconnect() {
 
 // Stop shuts down the client.
 func (s *Client) Stop() {
-	s.cancel()
-	if s.holePuncher != nil {
-		s.holePuncher.Stop()
+	s.startStopMu.Lock()
+	defer s.startStopMu.Unlock()
+
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		return
+	}
+	s.stopping = true
+	s.lifecycleMu.Unlock()
+
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if holePuncher := s.holePuncher.Load(); holePuncher != nil {
+		holePuncher.Stop()
 	}
 	if s.localConn != nil {
 		_ = s.localConn.Close()
@@ -1451,6 +1809,9 @@ func (s *Client) Stop() {
 
 	s.candidateMu.Lock()
 	for _, cand := range s.candidates {
+		if cand == nil {
+			continue
+		}
 		if cand.conn != nil {
 			_ = cand.conn.Close()
 		}
@@ -1486,7 +1847,6 @@ type CandidateStatus struct {
 	Online        bool            `json:"online"`
 	RTT           time.Duration   `json:"rtt"`
 	PathType      router.PathType `json:"path_type"`
-	PathHint      string          `json:"path_hint"`
 	IsLAN         bool            `json:"is_lan"`
 	IsPunch       bool            `json:"is_punch"`
 	IsActive      bool            `json:"is_active"`
@@ -1519,18 +1879,24 @@ func (s *Client) Status() ClientStatus {
 	cands := make([]*serverCandidate, len(s.candidates))
 	copy(cands, s.candidates)
 	mode := s.routeMode()
-	listenAddr := s.cfg.ListenAddr
-	enablePunch := s.cfg.EnablePunch
+	listenAddr := ""
+	enablePunch := false
+	if s.cfg != nil {
+		listenAddr = s.cfg.ListenAddr
+		enablePunch = s.cfg.EnablePunch
+	}
 	s.candidateMu.RUnlock()
 
 	activeCandStr := ""
+	activePath := router.PathNone
 	var activeRTT time.Duration
 	activeOnline := false
 	if activeCand != nil {
 		activeCandStr = activeCand.addrStr
 		activeCand.mu.RLock()
-		activeOnline = activeCand.online && s.candidateAllowedValues(activeCand.isLAN, activeCand.pathHint, activeCand.isPunch)
+		activeOnline = activeCand.online && s.candidateAllowedValues(activeCand.isLAN, activeCand.pathClass, activeCand.isPunch)
 		activeRTT = activeCand.rtt
+		activePath = pathForCandidateValues(activeCand.isLAN, activeCand.pathClass, activeCand.isPunch)
 		if activeCand.udpAddr != nil && activeCand.addrStr != activeCand.udpAddr.String() {
 			activeCandStr = fmt.Sprintf("%s (%s)", activeCand.addrStr, activeCand.udpAddr.String())
 		}
@@ -1538,6 +1904,7 @@ func (s *Client) Status() ClientStatus {
 	}
 	if !activeOnline {
 		activeCandStr = ""
+		activePath = router.PathNone
 		activeRTT = 0
 	}
 
@@ -1558,6 +1925,9 @@ func (s *Client) Status() ClientStatus {
 
 	candStatuses := make([]CandidateStatus, 0, len(cands))
 	for _, c := range cands {
+		if c == nil {
+			continue
+		}
 		c.mu.RLock()
 		resolvedIP := ""
 		if c.udpAddr != nil {
@@ -1569,8 +1939,7 @@ func (s *Client) Status() ClientStatus {
 			ResolvedIP:    resolvedIP,
 			Online:        c.online,
 			RTT:           c.rtt,
-			PathType:      pathForCandidateValues(c.isLAN, c.pathHint, c.isPunch),
-			PathHint:      c.pathHint,
+			PathType:      pathForCandidateValues(c.isLAN, c.pathClass, c.isPunch),
 			IsLAN:         c.isLAN,
 			IsPunch:       c.isPunch,
 			IsActive:      isActive,
@@ -1581,10 +1950,6 @@ func (s *Client) Status() ClientStatus {
 		c.mu.RUnlock()
 	}
 
-	activePath := s.router.CurrentPath()
-	if !activeOnline {
-		activePath = ""
-	}
 	return ClientStatus{
 		SessionID:       s.sessionID.Load(),
 		ListenAddr:      listenAddr,
@@ -1692,11 +2057,40 @@ func (s *Client) detectNATLoop() {
 	if s.routeMode() == "relay-only" {
 		return
 	}
-	s.DetectNAT()
+	s.runNATDetection()
+}
+
+// runNATDetection coalesces concurrent requests from startup and Probe.  NAT
+// probing opens its own socket and can take several seconds; spawning one copy
+// per CLI/status probe needlessly consumes descriptors and outbound traffic.
+func (s *Client) runNATDetection() *stun.NATMappingInfo {
+	if s == nil || !s.natDetecting.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer s.natDetecting.Store(false)
+	return s.DetectNAT()
+}
+
+func (s *Client) scheduleNATDetection() {
+	if s == nil || !s.natDetecting.CompareAndSwap(false, true) {
+		return
+	}
+	if !s.startTask(func() {
+		defer s.wg.Done()
+		defer s.natDetecting.Store(false)
+		_ = s.DetectNAT()
+	}) {
+		s.natDetecting.Store(false)
+	}
 }
 
 // DetectNAT performs STUN-based NAT mapping detection and updates the cached NAT info.
 func (s *Client) DetectNAT() *stun.NATMappingInfo {
+	if s == nil {
+		return nil
+	}
+	s.natMu.Lock()
+	defer s.natMu.Unlock()
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -1723,6 +2117,9 @@ func (s *Client) Probe() {
 	s.candidateMu.RUnlock()
 
 	for _, cand := range cands {
+		if cand == nil {
+			continue
+		}
 		if s.candidateAllowed(cand) {
 			if marshaledPing, pingErr := s.sealClientPacket(protocol.CmdPing, []byte("PING")); pingErr == nil {
 				_ = cand.send(marshaledPing)
@@ -1731,7 +2128,7 @@ func (s *Client) Probe() {
 		cand.mu.RLock()
 		isPunch := cand.isPunch
 		online := cand.online
-		hint := cand.pathHint
+		hint := cand.pathClass
 		cand.mu.RUnlock()
 		if !isPunch && !online && (s.routeMode() != "relay-only" || hint == "") {
 			s.sendHandshake(cand)
@@ -1740,7 +2137,7 @@ func (s *Client) Probe() {
 
 	// Trigger async NAT re-detection if unknown
 	if s.routeMode() != "relay-only" && s.natInfo.Load() == nil {
-		go s.DetectNAT()
+		s.scheduleNATDetection()
 	}
 
 	time.Sleep(100 * time.Millisecond)
@@ -1754,6 +2151,7 @@ func (s *Client) SetMode(mode string) error {
 		return err
 	}
 	mode = normalized
+	previousMode := s.routeMode()
 
 	s.mode.Store(mode)
 	s.candidateMu.Lock()
@@ -1763,6 +2161,7 @@ func (s *Client) SetMode(mode string) error {
 	s.candidateMu.Unlock()
 
 	s.router.SetMode(mode)
+	var retire []*serverCandidate
 	if mode == "relay-only" {
 		s.candidateMu.Lock()
 		if s.bestCandidate != nil && !s.candidateAllowed(s.bestCandidate) {
@@ -1770,9 +2169,49 @@ func (s *Client) SetMode(mode string) error {
 		}
 		s.prevCandidate = nil
 		s.dualSendUntil = time.Time{}
+		for _, cand := range s.candidates {
+			if cand == nil {
+				continue
+			}
+			cand.mu.RLock()
+			isPunch := cand.isPunch
+			cand.mu.RUnlock()
+			if isPunch {
+				retire = append(retire, cand)
+			}
+		}
 		s.candidateMu.Unlock()
 	}
+	for _, cand := range retire {
+		s.retirePunchCandidate(cand, "retired after switching to relay-only")
+	}
 	s.selectBestCandidate()
+	if previousMode == "relay-only" && mode != "relay-only" && s.cfg != nil && s.cfg.EnablePunch {
+		// Punch candidates are intentionally closed in relay-only mode. Recreate
+		// them from the authenticated endpoint cached on an online relay when the
+		// operator enables direct routing again.
+		s.candidateMu.RLock()
+		offers := make([]string, 0, len(s.candidates))
+		seen := make(map[string]struct{})
+		for _, cand := range s.candidates {
+			if cand == nil {
+				continue
+			}
+			cand.mu.RLock()
+			hint, online, offer := cand.pathClass, cand.online, cand.punchEndpoint
+			cand.mu.RUnlock()
+			if hint == candidatePathRelay && online && offer != "" {
+				if _, exists := seen[offer]; !exists {
+					seen[offer] = struct{}{}
+					offers = append(offers, offer)
+				}
+			}
+		}
+		s.candidateMu.RUnlock()
+		for _, offer := range offers {
+			s.maybeCreatePunchCandidate(offer)
+		}
+	}
 	log.Printf("[Client] Route mode switched to: %s", mode)
 	return nil
 }
@@ -1784,6 +2223,13 @@ func (s *Client) GetMode() string {
 
 func sameUDPAddr(a, b *net.UDPAddr) bool {
 	return a != nil && b != nil && a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
+}
+
+func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), addr.IP...), Port: addr.Port, Zone: addr.Zone}
 }
 
 func reflectAddress(addr net.Addr) string {

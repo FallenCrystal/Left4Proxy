@@ -144,6 +144,14 @@ func NewHandshakeResponse(key []byte, req *HandshakeRequest, sessionID uint64, m
 	if len(key) != KeySize || req == nil || req.ClientPublic == nil || sessionID == 0 || req.Seq == 0 {
 		return nil, nil, ErrHandshakeMalformed
 	}
+	fixedBodyLen := len(HandshakeMagic) + HandshakeNonceSize*2 + HandshakePubSize + 2
+	// Validate the response size before performing X25519 or allocating key
+	// material. A bad operator-supplied candidate list should fail cheaply even
+	// when many authenticated clients retry their handshake.
+	maxMetadataLen := protocol.MaxPacketPayloadSize - fixedBodyLen - HandshakeTagSize
+	if maxMetadataLen < 0 || len(metadata) > maxMetadataLen {
+		return nil, nil, fmt.Errorf("handshake metadata too large")
+	}
 	private, err := ecdh.X25519().GenerateKey(randReader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate server ephemeral key: %w", err)
@@ -157,10 +165,6 @@ func NewHandshakeResponse(key []byte, req *HandshakeRequest, sessionID uint64, m
 		return nil, nil, fmt.Errorf("generate server handshake nonce: %w", err)
 	}
 	serverPublic := private.PublicKey().Bytes()
-	fixedBodyLen := len(HandshakeMagic) + HandshakeNonceSize*2 + HandshakePubSize + 2
-	if len(metadata) > int(^uint16(0))-fixedBodyLen-HandshakeTagSize {
-		return nil, nil, fmt.Errorf("handshake metadata too large")
-	}
 	pkt := &protocol.Packet{
 		Version:   protocol.Version2,
 		Cmd:       protocol.CmdHandshakeResp,
@@ -340,7 +344,7 @@ func (s *Session) Seal(pkt *protocol.Packet, direction Direction) ([]byte, error
 	}
 	nonce := makeNonce(s.ID, pkt.Seq)
 	wirePayloadLen := len(pkt.Payload) + aead.Overhead()
-	if wirePayloadLen > math.MaxUint16 {
+	if wirePayloadLen > protocol.MaxPacketPayloadSize {
 		return nil, fmt.Errorf("packet payload exceeds wire limit")
 	}
 	aad := pkt.MarshalHeader(wirePayloadLen)

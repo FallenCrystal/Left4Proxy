@@ -43,6 +43,9 @@ func DetectNATMapping(ctx context.Context, conn *net.UDPConn, server1, server2 *
 	if sameUDPAddr(server1, server2) {
 		return nil, errors.New("two distinct STUN server addresses are required")
 	}
+	if timeout <= 0 {
+		return nil, errors.New("STUN detection timeout must be positive")
+	}
 
 	info := &NATMappingInfo{
 		Behavior: MappingUnknown,
@@ -116,6 +119,9 @@ func DetectClientNAT(ctx context.Context, customStunServer string, timeout time.
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if timeout <= 0 {
+		return nil, errors.New("STUN detection timeout must be positive")
+	}
 	stunCandidates := []string{}
 	if customStunServer != "" {
 		stunCandidates = append(stunCandidates, customStunServer)
@@ -164,7 +170,9 @@ func DetectClientNAT(ctx context.Context, customStunServer string, timeout time.
 	}
 
 	validator := NewValidator()
-	_ = validator.SendMultiBindingRequests(conn, addrs)
+	if err := validator.SendMultiBindingRequests(conn, addrs); err != nil {
+		return nil, fmt.Errorf("failed to send STUN requests: %w", err)
+	}
 
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 2048)
@@ -202,9 +210,14 @@ func DetectClientNAT(ctx context.Context, customStunServer string, timeout time.
 		Behavior: MappingUnknown,
 	}
 
+	// Preserve the configured destination order instead of ranging over the map;
+	// stable Primary/Secondary assignment makes PortDelta and diagnostics
+	// reproducible across runs.
 	var endpoints []*net.UDPAddr
-	for _, ep := range reflections {
-		endpoints = append(endpoints, ep)
+	for _, server := range addrs {
+		if ep, ok := reflections[server.String()]; ok {
+			endpoints = append(endpoints, ep)
+		}
 	}
 
 	info.PrimaryAddr = endpoints[0]

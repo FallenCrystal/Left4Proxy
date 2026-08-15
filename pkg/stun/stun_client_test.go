@@ -102,7 +102,11 @@ func TestValidatorRejectsForgedResponses(t *testing.T) {
 	}
 	copy(valid[8:20], buf[8:20])
 	// A valid response from a different source is still rejected.
-	wrongSource := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: serverAddr.Port + 1}
+	wrongPort := serverAddr.Port + 1
+	if wrongPort > 65535 {
+		wrongPort = serverAddr.Port - 1
+	}
+	wrongSource := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrongPort}
 	if _, err := validator.Accept(valid, wrongSource); err == nil {
 		t.Fatal("response from wrong source accepted")
 	}

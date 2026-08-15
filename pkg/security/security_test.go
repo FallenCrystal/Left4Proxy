@@ -147,6 +147,23 @@ func TestSequenceExhaustionIsPermanent(t *testing.T) {
 	}
 }
 
+func TestHandshakeMetadataRespectsUDPPayloadLimit(t *testing.T) {
+	key := testKey()
+	reqPkt, _, err := NewHandshakeRequest(key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := VerifyHandshakeRequest(key, reqPkt, time.Now().UnixNano())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedBodyLen := len(HandshakeMagic) + HandshakeNonceSize*2 + HandshakePubSize + 2
+	maxMetadata := protocol.MaxPacketPayloadSize - fixedBodyLen - HandshakeTagSize
+	if _, _, err := NewHandshakeResponse(key, req, 123, make([]byte, maxMetadata+1)); err == nil {
+		t.Fatal("handshake metadata exceeding the UDP payload limit was accepted")
+	}
+}
+
 func TestSecretSymlinkRejected(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX symlink permission test")

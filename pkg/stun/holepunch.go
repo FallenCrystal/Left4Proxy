@@ -4,18 +4,36 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 // ReflectAddress formats a net.Addr into an IP:Port string payload.
 func ReflectAddress(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
 	return addr.String()
 }
 
 // ParseReflectedAddress parses IP:Port string back into net.UDPAddr.
 func ParseReflectedAddress(addrStr string) (*net.UDPAddr, error) {
-	return net.ResolveUDPAddr("udp", addrStr)
+	addrStr = strings.TrimSpace(addrStr)
+	host, portText, err := net.SplitHostPort(addrStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid reflected UDP endpoint %q: %w", addrStr, err)
+	}
+	ip := net.ParseIP(host)
+	port, portErr := strconv.Atoi(portText)
+	if ip == nil || portErr != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid reflected UDP endpoint %q", addrStr)
+	}
+	// STUN returns a numeric endpoint. Avoid hostname resolution here: this
+	// parser runs in the server's single UDP receive loop, where a client-sent
+	// DNS name could otherwise block every session while the resolver waits.
+	return &net.UDPAddr{IP: append(net.IP(nil), ip...), Port: port}, nil
 }
 
 // HolePuncher manages UDP hole-punching probes and keepalives.
@@ -27,8 +45,9 @@ type HolePuncher struct {
 	probeLogged bool         // First successful probe is logged for visibility; subsequent ones are silent.
 	secureSend  func() error // Required authenticated sender supplied by the client.
 	stopCh      chan struct{}
-	startOnce   sync.Once
-	stopOnce    sync.Once
+	lifecycleMu sync.Mutex // Serializes StartPunching with Stop.
+	started     bool
+	stopped     bool
 	wg          sync.WaitGroup
 }
 
@@ -36,8 +55,23 @@ type HolePuncher struct {
 // There is deliberately no raw packet fallback: a missing callback fails
 // closed so hole punching cannot bypass the session AEAD layer.
 func (hp *HolePuncher) SetSecureSender(sender func() error) {
+	if hp == nil {
+		return
+	}
 	hp.mu.Lock()
 	hp.secureSend = sender
+	hp.mu.Unlock()
+}
+
+// SetSessionID updates the identifier used only in probe diagnostics. The
+// client creates its HolePuncher before the first handshake, so retaining the
+// constructor's zero value would make otherwise useful logs look unauthenticated.
+func (hp *HolePuncher) SetSessionID(sessionID uint64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	hp.sessionID = sessionID
 	hp.mu.Unlock()
 }
 
@@ -49,13 +83,16 @@ func NewHolePuncher(sessionID uint64, conn *net.UDPConn, sendTo *net.UDPAddr) *H
 	return &HolePuncher{
 		sessionID: sessionID,
 		conn:      conn,
-		sendTo:    sendTo,
+		sendTo:    cloneUDPAddr(sendTo),
 		stopCh:    make(chan struct{}),
 	}
 }
 
 // SendBurst sends an immediate burst of N probes spaced by interval.
 func (hp *HolePuncher) SendBurst(count int, interval time.Duration) {
+	if hp == nil {
+		return
+	}
 	for i := 0; i < count; i++ {
 		select {
 		case <-hp.stopCh:
@@ -79,36 +116,43 @@ func (hp *HolePuncher) StartPunching(interval time.Duration) {
 	if interval <= 0 {
 		interval = 3 * time.Second
 	}
-	hp.startOnce.Do(func() {
-		select {
-		case <-hp.stopCh:
-			return
-		default:
-		}
-		hp.wg.Add(1)
-		go func() {
-			defer hp.wg.Done()
-			// Fast burst to open hole immediately
-			hp.SendBurst(5, 25*time.Millisecond)
+	hp.lifecycleMu.Lock()
+	if hp.started || hp.stopped {
+		hp.lifecycleMu.Unlock()
+		return
+	}
+	// Add to the wait group while holding the same lock Stop uses before it
+	// waits. This prevents Stop from observing a zero counter and returning
+	// between the stop check and this goroutine's registration.
+	hp.started = true
+	hp.wg.Add(1)
+	hp.lifecycleMu.Unlock()
+	go func() {
+		defer hp.wg.Done()
+		// Fast burst to open hole immediately
+		hp.SendBurst(5, 25*time.Millisecond)
 
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-hp.stopCh:
-					return
-				case <-ticker.C:
-					_ = hp.SendProbe()
-				}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hp.stopCh:
+				return
+			case <-ticker.C:
+				_ = hp.SendProbe()
 			}
-		}()
-	})
+		}
+	}()
 }
 
 // SendProbe transmits one probe through the authenticated client callback.
 func (hp *HolePuncher) SendProbe() error {
+	if hp == nil {
+		return fmt.Errorf("hole puncher is nil")
+	}
 	hp.mu.Lock()
 	secureSend := hp.secureSend
+	sessionID := hp.sessionID
 	hp.mu.Unlock()
 	if secureSend == nil {
 		return fmt.Errorf("hole puncher authenticated sender is not configured")
@@ -121,7 +165,7 @@ func (hp *HolePuncher) SendProbe() error {
 	hp.probeLogged = true
 	hp.mu.Unlock()
 	if first {
-		log.Printf("[Client] Authenticated STUN probe sent (sessionID=%d)", hp.sessionID)
+		log.Printf("[Client] Authenticated STUN probe sent (sessionID=%d)", sessionID)
 	}
 	return nil
 }
@@ -129,9 +173,12 @@ func (hp *HolePuncher) SendProbe() error {
 // Retarget points the puncher at the currently-active candidate socket, so the
 // keepalives keep the NAT mapping of the path that actually carries data alive.
 func (hp *HolePuncher) Retarget(conn *net.UDPConn, sendTo *net.UDPAddr) {
+	if hp == nil {
+		return
+	}
 	hp.mu.Lock()
 	hp.conn = conn
-	hp.sendTo = sendTo
+	hp.sendTo = cloneUDPAddr(sendTo)
 	hp.mu.Unlock()
 }
 
@@ -140,6 +187,14 @@ func (hp *HolePuncher) Stop() {
 	if hp == nil {
 		return
 	}
-	hp.stopOnce.Do(func() { close(hp.stopCh) })
+	hp.lifecycleMu.Lock()
+	if hp.stopped {
+		hp.lifecycleMu.Unlock()
+		hp.wg.Wait()
+		return
+	}
+	hp.stopped = true
+	close(hp.stopCh)
+	hp.lifecycleMu.Unlock()
 	hp.wg.Wait()
 }

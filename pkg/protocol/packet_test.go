@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -62,6 +63,20 @@ func TestUnmarshalInvalidMagic(t *testing.T) {
 	}
 }
 
+func TestExportedMagicCannotChangeWireProtocol(t *testing.T) {
+	original := Magic
+	Magic = [4]byte{'B', 'A', 'D', '!'}
+	t.Cleanup(func() { Magic = original })
+	pkt := NewPacket(CmdPing, 1, 1, nil)
+	wire := pkt.Marshal()
+	if string(wire[:4]) != "L4DP" {
+		t.Fatalf("wire magic changed through exported compatibility value: %q", wire[:4])
+	}
+	if _, err := Unmarshal(wire); err != nil {
+		t.Fatalf("canonical packet rejected after Magic mutation: %v", err)
+	}
+}
+
 func TestUnmarshalRejectsLegacyAndTrailingBytes(t *testing.T) {
 	pkt := NewPacket(CmdPing, 1, 1, []byte("x"))
 	wire := pkt.Marshal()
@@ -76,20 +91,19 @@ func TestUnmarshalRejectsLegacyAndTrailingBytes(t *testing.T) {
 	}
 }
 
-func TestPathHintEncoding(t *testing.T) {
-	for _, want := range []string{PathHintLAN, PathHintRelay, PathHintPunch, PathHintDirect} {
-		payload := EncodePathHint(want)
-		if len(payload) == 0 {
-			t.Fatalf("failed to encode %q", want)
-		}
-		if got, ok := DecodePathHint(payload); !ok || got != want {
-			t.Fatalf("decoded hint = %q, ok=%v; want %q", got, ok, want)
-		}
+func TestUnmarshalRejectsDatagramsThatExceedUDPSize(t *testing.T) {
+	pkt := NewPacket(CmdData, 1, 1, make([]byte, MaxPacketPayloadSize+1))
+	wire := pkt.Marshal()
+	if _, err := Unmarshal(wire); err == nil || !errors.Is(err, ErrPacketTooLarge) {
+		t.Fatalf("oversized packet error = %v, want ErrPacketTooLarge", err)
 	}
-	if EncodePathHint("unknown") != nil {
-		t.Fatal("unknown path hint was encoded")
-	}
-	if _, ok := DecodePathHint([]byte("L4PATH:relay\x00")); ok {
-		t.Fatal("malformed path hint was accepted")
+
+	tooLargeGamePayload := make([]byte, MaxUDPPayloadSize+1)
+	tooLargeGamePayload[0] = 0xff
+	tooLargeGamePayload[1] = 0xff
+	tooLargeGamePayload[2] = 0xff
+	tooLargeGamePayload[3] = 0xff
+	if IsL4D2Packet(tooLargeGamePayload) {
+		t.Fatal("oversized UDP payload was classified as an L4D2 packet")
 	}
 }

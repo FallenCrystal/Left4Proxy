@@ -22,6 +22,8 @@ type SecureUDPTransport struct {
 	sendDirection security.Direction
 	recvDirection security.Direction
 	mu            sync.RWMutex
+	bindMu        sync.Mutex // Serializes first-packet authentication before source binding.
+	connected     bool       // Connected UDP sockets must use Write, never WriteToUDP.
 }
 
 // NewSecureUDPTransport creates a secure UDP transport.  targetAddr may be
@@ -37,12 +39,20 @@ func NewSecureUDPTransport(conn *net.UDPConn, targetAddr *net.UDPAddr, session *
 	if !validDirection(sendDirection) || !validDirection(recvDirection) {
 		return nil, errors.New("secure UDP transport: invalid packet direction")
 	}
+	connectedPeer, connected := conn.RemoteAddr().(*net.UDPAddr)
+	if connected {
+		if targetAddr != nil && !sameUDPAddr(targetAddr, connectedPeer) {
+			return nil, fmt.Errorf("secure UDP transport: target %s does not match connected peer %s", targetAddr, connectedPeer)
+		}
+		targetAddr = connectedPeer
+	}
 	return &SecureUDPTransport{
 		conn:          conn,
 		targetAddr:    cloneUDPAddr(targetAddr),
 		session:       session,
 		sendDirection: sendDirection,
 		recvDirection: recvDirection,
+		connected:     connected,
 	}, nil
 }
 
@@ -55,34 +65,38 @@ func (u *SecureUDPTransport) Send(pkt *protocol.Packet) error {
 	dst := cloneUDPAddr(u.targetAddr)
 	direction := u.sendDirection
 	conn := u.conn
+	connected := u.connected
 	u.mu.RUnlock()
 	if session == nil || conn == nil {
 		return errors.New("secure UDP transport: transport is closed")
 	}
 	secured := *pkt
-	if secured.SessionID == 0 {
-		secured.SessionID = session.ID
-	}
-	if secured.SessionID != session.ID {
+	if secured.SessionID != 0 && secured.SessionID != session.ID {
 		return security.ErrSessionMismatch
 	}
-	if secured.Seq == 0 {
-		seq, err := session.NextSeq()
-		if err != nil {
-			return err
-		}
-		secured.Seq = seq
+	secured.SessionID = session.ID
+	// Never honor a caller-supplied sequence. Reusing a sequence would reuse
+	// the deterministic AES-GCM nonce and can compromise confidentiality; the
+	// transport owns the direction-local counter just like the production
+	// client/server send paths.
+	seq, err := session.NextSeq()
+	if err != nil {
+		return err
 	}
+	secured.Seq = seq
 	data, err := session.Seal(&secured, direction)
 	if err != nil {
+		return err
+	}
+	if connected {
+		_, err = conn.Write(data)
 		return err
 	}
 	if dst != nil {
 		_, err = conn.WriteToUDP(data, dst)
 		return err
 	}
-	_, err = conn.Write(data)
-	return err
+	return errors.New("secure UDP transport: destination is unavailable")
 }
 
 func (u *SecureUDPTransport) Receive() (*protocol.Packet, error) {
@@ -98,6 +112,17 @@ func (u *SecureUDPTransport) Receive() (*protocol.Packet, error) {
 	if conn == nil || session == nil {
 		return nil, errors.New("secure UDP transport is closed")
 	}
+	if target == nil {
+		// Do not let an unauthenticated first datagram pin an unconnected
+		// transport to an attacker-controlled source. Serialize discovery so two
+		// simultaneous first packets cannot consume replay slots before the source
+		// binding decision is made.
+		u.bindMu.Lock()
+		defer u.bindMu.Unlock()
+		u.mu.RLock()
+		target = cloneUDPAddr(u.targetAddr)
+		u.mu.RUnlock()
+	}
 	buf := make([]byte, 65535)
 	n, source, err := conn.ReadFromUDP(buf)
 	if err != nil {
@@ -106,12 +131,21 @@ func (u *SecureUDPTransport) Receive() (*protocol.Packet, error) {
 	if target != nil && !sameUDPAddr(source, target) {
 		return nil, fmt.Errorf("secure UDP transport: unexpected packet source %s", source)
 	}
-	u.mu.Lock()
-	if u.targetAddr == nil {
-		u.targetAddr = cloneUDPAddr(source)
+	opened, err := session.Open(buf[:n], direction)
+	if err != nil {
+		return nil, err
 	}
-	u.mu.Unlock()
-	return session.Open(buf[:n], direction)
+	if target == nil {
+		u.mu.Lock()
+		if u.targetAddr == nil {
+			u.targetAddr = cloneUDPAddr(source)
+		} else if !sameUDPAddr(u.targetAddr, source) {
+			u.mu.Unlock()
+			return nil, fmt.Errorf("secure UDP transport: unexpected packet source %s", source)
+		}
+		u.mu.Unlock()
+	}
+	return opened, nil
 }
 
 func (u *SecureUDPTransport) Close() error {

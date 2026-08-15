@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,12 +16,88 @@ import (
 	"left4proxy/pkg/stun"
 )
 
+func TestServerConcurrentStartStopDoesNotLeakOrHang(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		cfg := &config.ServerConfig{
+			ListenAddr: "127.0.0.1:0",
+			TargetAddr: "127.0.0.1:27015",
+			PunchAddr:  "127.0.0.1:1",
+			AuthKey:    serverTestKey(),
+		}
+		srv, err := NewServer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var callers sync.WaitGroup
+		callers.Add(2)
+		go func() {
+			defer callers.Done()
+			_ = srv.Start()
+		}()
+		go func() {
+			defer callers.Done()
+			srv.Stop()
+		}()
+		done := make(chan struct{})
+		go func() { callers.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent server Start/Stop hung")
+		}
+		srv.Stop()
+	}
+}
+
 func serverTestKey() []byte {
 	key := make([]byte, security.KeySize)
 	for i := range key {
 		key[i] = byte(0xA0 + i)
 	}
 	return key
+}
+
+func TestActiveUPnPMappingTakesPriorityOverLateSTUNResponse(t *testing.T) {
+	srv, err := NewServer(&config.ServerConfig{AuthKey: serverTestKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.serverPubMu.Lock()
+	srv.upnpCleanup = func() {}
+	srv.serverPubMu.Unlock()
+
+	upnpAddr := &net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 27014}
+	staleSTUNAddr := &net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 49152}
+	srv.updateServerPublic(upnpAddr)
+	srv.updateServerPublicFromSTUN(staleSTUNAddr)
+
+	if got := srv.publicEndpointString(); got != upnpAddr.String() {
+		t.Fatalf("late STUN response replaced active UPnP endpoint: got %s, want %s", got, upnpAddr)
+	}
+}
+
+func TestPruneStunProbeLogRemovesExpiredEntries(t *testing.T) {
+	cfg := config.DefaultServerConfig()
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	srv.stunProbeLogMu.Lock()
+	srv.stunProbeLogged["old-probe"] = now.Add(-stunProbeLogTTL - time.Second)
+	srv.stunProbeLogged["live-probe"] = now
+	srv.stunProbeLogMu.Unlock()
+
+	srv.pruneStunProbeLog(now)
+
+	srv.stunProbeLogMu.Lock()
+	defer srv.stunProbeLogMu.Unlock()
+	if _, ok := srv.stunProbeLogged["old-probe"]; ok {
+		t.Fatal("expired STUN log entry was retained")
+	}
+	if _, ok := srv.stunProbeLogged["live-probe"]; !ok {
+		t.Fatal("live STUN log entry was removed")
+	}
 }
 
 func serverHandshake(t *testing.T, conn *net.UDPConn, serverAddr *net.UDPAddr, key []byte) (uint64, *security.Session) {
@@ -153,7 +230,6 @@ func TestAuthenticatedPingBindsCandidateWithoutChangingSession(t *testing.T) {
 	cfg := &config.ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		TargetAddr: upstream.LocalAddr().String(),
-		NAT:        "false",
 		PunchAddr:  "127.0.0.1:1", // avoid external STUN traffic in this test
 		AuthKey:    key,
 	}
@@ -209,8 +285,8 @@ func TestAuthenticatedPingBindsCandidateWithoutChangingSession(t *testing.T) {
 			pong = candidate
 		}
 	}
-	if hint, ok := protocol.DecodePathHint(pong.Payload); !ok || hint != protocol.PathHintLAN {
-		t.Fatalf("unexpected authenticated path hint: %q (ok=%v)", pong.Payload, ok)
+	if string(pong.Payload) != "PONG" {
+		t.Fatalf("unexpected pong payload: %q", pong.Payload)
 	}
 
 	dataPayload := []byte{0xff, 0xff, 0xff, 0xff, 'T', 'E', 'S', 'T'}
@@ -258,7 +334,6 @@ func TestServerAutoGatherHostCandidates(t *testing.T) {
 	cfg := &config.ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		TargetAddr: "127.0.0.1:27015",
-		NAT:        "false",
 		PublicIPs:  []string{"game.example.com:27014"},
 		AuthKey:    key,
 	}
@@ -327,12 +402,78 @@ func TestServerAutoGatherHostCandidates(t *testing.T) {
 	}
 }
 
+func TestServerNormalizesBarePublicEndpointsToBoundPort(t *testing.T) {
+	key := serverTestKey()
+	cfg := &config.ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		TargetAddr: "127.0.0.1:27015",
+		PublicIPs:  []string{"198.51.100.20", "game.example.com", "[2001:db8::20]"},
+		AuthKey:    key,
+	}
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	boundPort := srv.udpConn.LocalAddr().(*net.UDPAddr).Port
+	metadata := strings.Split(string(srv.handshakeMetadata(&net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 40000})), "|")
+	if len(metadata) != 3 {
+		t.Fatalf("metadata fields = %d, want 3", len(metadata))
+	}
+	for _, wantHost := range []string{"198.51.100.20", "game.example.com", "[2001:db8::20]"} {
+		if !strings.Contains(metadata[1], wantHost+fmt.Sprintf(":%d", boundPort)) {
+			t.Fatalf("metadata candidates %q missing normalized %s:%d", metadata[1], wantHost, boundPort)
+		}
+	}
+}
+
+func TestServerRejectsInvalidPublicEndpointAtStartup(t *testing.T) {
+	cfg := &config.ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		TargetAddr: "127.0.0.1:27015",
+		PublicIPs:  []string{"game.example:70000"},
+		AuthKey:    serverTestKey(),
+	}
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err == nil {
+		srv.Stop()
+		t.Fatal("invalid public endpoint was accepted")
+	}
+}
+
+func TestServerRejectsMoreEndpointsThanClientsCanRetain(t *testing.T) {
+	publicIPs := make([]string, maxAdvertisedEndpoints+1)
+	for i := range publicIPs {
+		publicIPs[i] = fmt.Sprintf("host-%d.example", i)
+	}
+	cfg := &config.ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		TargetAddr: "127.0.0.1:27015",
+		PublicIPs:  publicIPs,
+		AuthKey:    serverTestKey(),
+	}
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err == nil {
+		srv.Stop()
+		t.Fatal("server accepted more advertised endpoints than clients retain")
+	}
+}
+
 func TestServerPunchInitBurstAndProbe(t *testing.T) {
 	key := serverTestKey()
 	cfg := &config.ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		TargetAddr: "127.0.0.1:27015",
-		NAT:        "true",
 		AuthKey:    key,
 	}
 
@@ -354,6 +495,7 @@ func TestServerPunchInitBurstAndProbe(t *testing.T) {
 
 	srvAddr := srv.udpConn.LocalAddr().(*net.UDPAddr)
 	sessionID, session := serverHandshake(t, relayConn, srvAddr, key)
+	defer session.Close()
 	buf := make([]byte, 2048)
 
 	// 2. Client creates punch socket
@@ -409,6 +551,67 @@ func TestServerPunchInitBurstAndProbe(t *testing.T) {
 	if count := probeCount.Load(); count < 2 {
 		t.Fatalf("expected at least 2 burst probes received on punch socket, got %d", count)
 	}
+
+	// Retargeting the same session must reuse its one probe worker. In
+	// particular, the old worker must not keep probing the previous endpoint
+	// after the authenticated client publishes a replacement mapping.
+	secondPunchConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondPunchConn.Close()
+	var secondProbeCount atomic.Int32
+	go func() {
+		pBuf := make([]byte, 1024)
+		for {
+			pn, _, pErr := secondPunchConn.ReadFromUDP(pBuf)
+			if pErr != nil {
+				return
+			}
+			pkt, openErr := session.Open(pBuf[:pn], security.ServerToClient)
+			if openErr == nil && pkt.Cmd == protocol.CmdStunProbe {
+				secondProbeCount.Add(1)
+			}
+		}
+	}()
+
+	// The first burst is complete after 200ms; record its stable count before
+	// switching so the next periodic tick can expose a stale old-target worker.
+	oldCount := probeCount.Load()
+	seq, err = session.NextSeq()
+	if err != nil {
+		t.Fatal(err)
+	}
+	punchInit, err = session.Seal(protocol.NewPacket(protocol.CmdPunchInit, sessionID, seq, []byte(secondPunchConn.LocalAddr().String())), security.ClientToServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relayConn.WriteToUDP(punchInit, srvAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	ackDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := relayConn.SetReadDeadline(ackDeadline); err != nil {
+			t.Fatal(err)
+		}
+		n, _, err = relayConn.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("failed to read retarget punch ack: %v", err)
+		}
+		ackPkt, openErr := session.Open(buf[:n], security.ServerToClient)
+		if openErr == nil && ackPkt.Cmd == protocol.CmdPunchAck {
+			break
+		}
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+	if got := probeCount.Load(); got != oldCount {
+		t.Fatalf("old punch endpoint kept receiving probes after retarget: before=%d after=%d", oldCount, got)
+	}
+	if got := secondProbeCount.Load(); got < 2 {
+		t.Fatalf("replacement punch endpoint received only %d probes", got)
+	}
 }
 
 func TestServerMultiStunDiscovery(t *testing.T) {
@@ -455,7 +658,6 @@ func TestServerMultiStunDiscovery(t *testing.T) {
 		ListenAddr: "127.0.0.1:0",
 		TargetAddr: "127.0.0.1:27015",
 		StunServer: fmt.Sprintf("127.0.0.1:%d", mockAddr.Port),
-		NAT:        "true",
 		AuthKey:    key,
 	}
 

@@ -49,7 +49,7 @@ func ResolveStunServers(servers []string) []*net.UDPAddr {
 			continue
 		}
 		addr, err := net.ResolveUDPAddr("udp", s)
-		if err == nil && addr != nil {
+		if err == nil && addr != nil && addr.Port > 0 && addr.Port <= 65535 && addr.IP != nil {
 			k := addr.String()
 			if !seen[k] {
 				seen[k] = true
@@ -115,8 +115,14 @@ func NewValidator() *Validator {
 // SendBindingRequest sends a request with a fresh transaction ID and records
 // the exact destination before any response can be accepted.
 func (v *Validator) SendBindingRequest(conn *net.UDPConn, server *net.UDPAddr) error {
+	if v == nil {
+		return errors.New("stun: validator is nil")
+	}
 	if conn == nil || server == nil {
 		return errors.New("stun: connection and server are required")
+	}
+	if !udpAddressFamilyCompatible(conn, server) {
+		return errors.New("stun: server address family is incompatible with socket")
 	}
 	v.mu.Lock()
 	v.pruneLocked(time.Now())
@@ -153,6 +159,12 @@ func (v *Validator) SendMultiBindingRequests(conn *net.UDPConn, servers []*net.U
 		if server == nil {
 			continue
 		}
+		if !udpAddressFamilyCompatible(conn, server) {
+			if firstErr == nil {
+				firstErr = errors.New("stun: no server destination matches socket address family")
+			}
+			continue
+		}
 		key := server.String()
 		if _, ok := seen[key]; ok {
 			continue
@@ -175,9 +187,27 @@ func (v *Validator) SendMultiBindingRequests(conn *net.UDPConn, servers []*net.U
 	return firstErr
 }
 
+// udpAddressFamilyCompatible avoids noisy EINVAL writes when a v4-bound
+// listener races a DNS result containing only IPv6 (or vice versa). An
+// unspecified socket may be dual-stack, so both families remain eligible in
+// that case and the kernel decides whether the individual write is supported.
+func udpAddressFamilyCompatible(conn *net.UDPConn, server *net.UDPAddr) bool {
+	if conn == nil || server == nil || server.IP == nil || server.Port <= 0 || server.Port > 65535 {
+		return false
+	}
+	local, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || local == nil || local.IP == nil || local.IP.IsUnspecified() {
+		return true
+	}
+	return (local.IP.To4() != nil) == (server.IP.To4() != nil)
+}
+
 // Accept validates and consumes one response.  Invalid, unsolicited, stale,
 // or source-mismatched packets are never allowed to update endpoint state.
 func (v *Validator) Accept(data []byte, source *net.UDPAddr) (*ValidatedResponse, error) {
+	if v == nil {
+		return nil, errors.New("stun: validator is nil")
+	}
 	if source == nil {
 		return nil, errors.New("stun: response source is nil")
 	}
