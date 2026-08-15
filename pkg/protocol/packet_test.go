@@ -61,3 +61,35 @@ func TestUnmarshalInvalidMagic(t *testing.T) {
 		t.Errorf("expected ErrInvalidMagic, got %v", err)
 	}
 }
+
+func TestUnmarshalRejectsLegacyAndTrailingBytes(t *testing.T) {
+	pkt := NewPacket(CmdPing, 1, 1, []byte("x"))
+	wire := pkt.Marshal()
+	wire[4] = Version1
+	if _, err := Unmarshal(wire); err != ErrInvalidVersion {
+		t.Fatalf("legacy version error = %v", err)
+	}
+	wire = pkt.Marshal()
+	wire = append(wire, 0)
+	if _, err := Unmarshal(wire); err == nil {
+		t.Fatal("packet with trailing bytes was accepted")
+	}
+}
+
+func TestPathHintEncoding(t *testing.T) {
+	for _, want := range []string{PathHintLAN, PathHintRelay, PathHintPunch, PathHintDirect} {
+		payload := EncodePathHint(want)
+		if len(payload) == 0 {
+			t.Fatalf("failed to encode %q", want)
+		}
+		if got, ok := DecodePathHint(payload); !ok || got != want {
+			t.Fatalf("decoded hint = %q, ok=%v; want %q", got, ok, want)
+		}
+	}
+	if EncodePathHint("unknown") != nil {
+		t.Fatal("unknown path hint was encoded")
+	}
+	if _, ok := DecodePathHint([]byte("L4PATH:relay\x00")); ok {
+		t.Fatal("malformed path hint was accepted")
+	}
+}

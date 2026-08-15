@@ -17,7 +17,12 @@ type Transport interface {
 	RemoteAddr() net.Addr
 }
 
-// UDPTransport encapsulates UDP packet read/write.
+// UDPTransport is a low-level, unauthenticated framing primitive. It is kept
+// for protocol tooling and handshake experiments; production Left4Proxy data
+// traffic must use the authenticated security.Session path (or its
+// SecureUDPTransport adapter) so packets cannot be forged or read.
+//
+// Deprecated: use SecureUDPTransport for network traffic.
 type UDPTransport struct {
 	conn       *net.UDPConn
 	targetAddr *net.UDPAddr
@@ -32,6 +37,9 @@ func NewUDPTransport(conn *net.UDPConn, targetAddr *net.UDPAddr) *UDPTransport {
 }
 
 func (u *UDPTransport) Send(pkt *protocol.Packet) error {
+	if u == nil || pkt == nil || u.conn == nil {
+		return fmt.Errorf("UDP transport is not ready")
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -51,9 +59,11 @@ func (u *UDPTransport) Receive() (*protocol.Packet, error) {
 	if err != nil {
 		return nil, err
 	}
+	u.mu.Lock()
 	if u.targetAddr == nil {
-		u.targetAddr = addr
+		u.targetAddr = cloneUDPAddr(addr)
 	}
+	u.mu.Unlock()
 	return protocol.Unmarshal(buf[:n])
 }
 
@@ -62,10 +72,20 @@ func (u *UDPTransport) Close() error {
 }
 
 func (u *UDPTransport) RemoteAddr() net.Addr {
-	return u.targetAddr
+	if u == nil {
+		return nil
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return cloneUDPAddr(u.targetAddr)
 }
 
-// TCPTransport encapsulates TCP packet stream framing read/write.
+// TCPTransport is a legacy, unauthenticated framing primitive retained for
+// offline tooling compatibility only. It has never been used in Left4Proxy's
+// production environment; production paths are UDP-only and never construct
+// this type. Do not use it for network traffic.
+//
+// Deprecated: production Left4Proxy transport is UDP-only.
 type TCPTransport struct {
 	conn net.Conn
 	mu   sync.Mutex

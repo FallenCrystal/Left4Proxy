@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"left4proxy/pkg/config"
+	"left4proxy/pkg/protocol"
 	"left4proxy/pkg/router"
 	"left4proxy/pkg/server"
 	"left4proxy/pkg/stun"
@@ -83,12 +84,17 @@ func TestPathForCandidate(t *testing.T) {
 // mkCand builds a serverCandidate with the given characteristics for routing tests.
 func mkCand(addr string, rtt time.Duration, online, lan bool) *serverCandidate {
 	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
+	hint := ""
+	if lan {
+		hint = protocol.PathHintLAN
+	}
 	return &serverCandidate{
 		addrStr:    addr,
 		udpAddr:    udpAddr,
 		online:     online,
 		rtt:        rtt,
 		isLAN:      lan,
+		pathHint:   hint,
 		lastActive: time.Now(),
 	}
 }
@@ -99,6 +105,8 @@ func TestClientModeRouting(t *testing.T) {
 	lan := mkCand("192.168.1.5:27014", 1*time.Millisecond, true, true)
 	wanSlow := mkCand("203.0.113.1:27014", 50*time.Millisecond, true, false)
 	wanFast := mkCand("198.51.100.1:27014", 20*time.Millisecond, true, false)
+	wanSlow.pathHint = "relay"
+	wanFast.pathHint = "direct"
 
 	c := &Client{cfg: cfg}
 
@@ -144,6 +152,47 @@ func TestClientModeRouting(t *testing.T) {
 	if c.bestCandidate != wanFast {
 		t.Fatalf("auto: expected faster WAN candidate, got %s", c.bestCandidate.addrStr)
 	}
+
+	// relay-only must fail closed when no candidate is explicitly classified as
+	// relay; a direct or punched endpoint must never become the destination.
+	directOnly := mkCand("198.51.100.20:27014", 5*time.Millisecond, true, false)
+	directOnly.pathHint = "direct"
+	punchOnly := mkCand("198.51.100.21:27014", 4*time.Millisecond, true, false)
+	punchOnly.pathHint = "punch"
+	punchOnly.isPunch = true
+	cfg.Mode = "relay-only"
+	c.candidates = []*serverCandidate{directOnly, punchOnly}
+	c.bestCandidate = directOnly
+	c.selectBestCandidate()
+	if c.bestCandidate != nil {
+		t.Fatalf("relay-only selected non-relay candidate %s", c.bestCandidate.addrStr)
+	}
+	if c.candidateAllowed(directOnly) || c.candidateAllowed(punchOnly) {
+		t.Fatal("relay-only marked a direct/punch candidate as allowed")
+	}
+}
+
+func TestRelayOnlyTrustsAuthenticatedPathHint(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	cfg.Mode = "relay-only"
+	c := &Client{cfg: cfg}
+
+	// A local tunnel endpoint may resolve to loopback/private space. The
+	// authenticated server label must still admit it as Relay.
+	localRelay := mkCand("127.0.0.1:27014", 5*time.Millisecond, true, true)
+	localRelay.pathHint = protocol.PathHintRelay
+	if !c.candidateAllowed(localRelay) {
+		t.Fatal("relay-only rejected an authenticated relay on a local address")
+	}
+
+	localRelay.pathHint = protocol.PathHintDirect
+	if c.candidateAllowed(localRelay) {
+		t.Fatal("relay-only admitted a direct candidate with a local address")
+	}
+	localRelay.pathHint = ""
+	if c.candidateAllowed(localRelay) {
+		t.Fatal("relay-only admitted an unclassified candidate")
+	}
 }
 
 func TestClientServerIntegration(t *testing.T) {
@@ -159,6 +208,7 @@ func TestClientServerIntegration(t *testing.T) {
 	serverCfg.ListenAddr = "127.0.0.1:27014"
 	serverCfg.TargetAddr = "127.0.0.1:27015"
 	serverCfg.PublicIPs = []string{"127.0.0.1:27014"}
+	serverCfg.AuthKey = integrationKey()
 
 	srv, err := server.NewServer(serverCfg)
 	if err != nil {
@@ -174,6 +224,7 @@ func TestClientServerIntegration(t *testing.T) {
 	clientCfg.ServerAddrs = []string{"127.0.0.1:27014"}
 	clientCfg.ListenAddr = "127.0.0.2:27015"
 	clientCfg.EnableLAN = true
+	clientCfg.AuthKey = serverCfg.AuthKey
 
 	cli, err := NewClient(clientCfg)
 	if err != nil {

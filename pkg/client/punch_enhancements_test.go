@@ -9,6 +9,7 @@ import (
 	"left4proxy/pkg/config"
 	"left4proxy/pkg/protocol"
 	"left4proxy/pkg/router"
+	"left4proxy/pkg/security"
 )
 
 func TestDualSendingDuringRouteMigration(t *testing.T) {
@@ -49,6 +50,7 @@ func TestDualSendingDuringRouteMigration(t *testing.T) {
 	clientCfg.ListenAddr = "127.0.0.1:0"
 	clientCfg.ServerAddrs = []string{relayConn.LocalAddr().String()}
 	clientCfg.EnablePunch = false // manual candidate setup
+	clientCfg.AuthKey = integrationKey()
 
 	cli, err := NewClient(clientCfg)
 	if err != nil {
@@ -58,6 +60,28 @@ func TestDualSendingDuringRouteMigration(t *testing.T) {
 		t.Fatalf("failed to start client: %v", err)
 	}
 	defer cli.Stop()
+	// The mock endpoints below do not implement the handshake themselves;
+	// install a real derived session so the local forwarding path is exercised
+	// with the same AEAD framing as production.
+	key := clientCfg.AuthKey
+	reqPkt, pending, err := security.NewHandshakeRequest(key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := security.VerifyHandshakeRequest(key, reqPkt, time.Now().UnixNano())
+	if err != nil {
+		t.Fatal(err)
+	}
+	respPkt, _, err := security.NewHandshakeResponse(key, req, 1234, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, clientSession, err := security.VerifyHandshakeResponse(key, respPkt, pending, time.Now().UnixNano())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.secureSession.Store(clientSession)
+	cli.sessionID.Store(clientSession.ID)
 
 	// Add punch candidate
 	punchCand, _ := cli.addCandidate(punchConn.LocalAddr().String())
@@ -107,6 +131,28 @@ func TestDualSendingDuringRouteMigration(t *testing.T) {
 	if relayCount := relayPacketCount.Load(); relayCount < 1 {
 		t.Errorf("expected relay candidate to receive duplicate packet during dual-sending window, got %d", relayCount)
 	}
+
+	// Switching to relay-only must clear the dual-send path and send the next
+	// game datagram exclusively to the explicitly classified relay candidate.
+	relayCand.mu.Lock()
+	relayCand.isLAN = false // loopback fixture represents an external relay.
+	relayCand.mu.Unlock()
+	punchCand.mu.Lock()
+	punchCand.isLAN = false
+	punchCand.mu.Unlock()
+	if err := cli.SetMode("relay-only"); err != nil {
+		t.Fatal(err)
+	}
+	beforeRelay := relayPacketCount.Load()
+	beforePunch := punchPacketCount.Load()
+	_, _ = senderConn.Write(gameData)
+	time.Sleep(100 * time.Millisecond)
+	if relayPacketCount.Load() <= beforeRelay {
+		t.Fatal("relay-only did not forward the game packet to the relay")
+	}
+	if got := punchPacketCount.Load(); got != beforePunch {
+		t.Fatalf("relay-only leaked game traffic to punch candidate: before=%d after=%d", beforePunch, got)
+	}
 }
 
 func TestFastFailoverDuringActiveGameplay(t *testing.T) {
@@ -114,6 +160,7 @@ func TestFastFailoverDuringActiveGameplay(t *testing.T) {
 	clientCfg.ListenAddr = "127.0.0.1:0"
 	clientCfg.ServerAddrs = []string{"127.0.0.1:39991"}
 	clientCfg.PingInterval = 1
+	clientCfg.AuthKey = integrationKey()
 
 	cli, err := NewClient(clientCfg)
 	if err != nil {

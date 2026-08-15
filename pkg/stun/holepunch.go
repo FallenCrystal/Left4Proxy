@@ -6,8 +6,6 @@ import (
 	"net"
 	"sync"
 	"time"
-
-	"left4proxy/pkg/protocol"
 )
 
 // ReflectAddress formats a net.Addr into an IP:Port string payload.
@@ -27,7 +25,20 @@ type HolePuncher struct {
 	conn        *net.UDPConn
 	sendTo      *net.UDPAddr // Non-nil for the unconnected punch socket; nil for connected candidate sockets.
 	probeLogged bool         // First successful probe is logged for visibility; subsequent ones are silent.
+	secureSend  func() error // Required authenticated sender supplied by the client.
 	stopCh      chan struct{}
+	startOnce   sync.Once
+	stopOnce    sync.Once
+	wg          sync.WaitGroup
+}
+
+// SetSecureSender installs the authenticated callback used for every probe.
+// There is deliberately no raw packet fallback: a missing callback fails
+// closed so hole punching cannot bypass the session AEAD layer.
+func (hp *HolePuncher) SetSecureSender(sender func() error) {
+	hp.mu.Lock()
+	hp.secureSend = sender
+	hp.mu.Unlock()
 }
 
 // NewHolePuncher creates a hole puncher for a target UDP socket. For a
@@ -46,6 +57,11 @@ func NewHolePuncher(sessionID uint64, conn *net.UDPConn, sendTo *net.UDPAddr) *H
 // SendBurst sends an immediate burst of N probes spaced by interval.
 func (hp *HolePuncher) SendBurst(count int, interval time.Duration) {
 	for i := 0; i < count; i++ {
+		select {
+		case <-hp.stopCh:
+			return
+		default:
+		}
 		_ = hp.SendProbe()
 		if i+1 < count && interval > 0 {
 			time.Sleep(interval)
@@ -57,80 +73,55 @@ func (hp *HolePuncher) SendBurst(count int, interval time.Duration) {
 // It begins with an immediate fast burst (5 probes at 25ms intervals) to punch through the
 // NAT state table within ~100ms, then transitions to periodic keepalives.
 func (hp *HolePuncher) StartPunching(interval time.Duration) {
-	go func() {
-		// Fast burst to open hole immediately
-		hp.SendBurst(5, 25*time.Millisecond)
-
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-hp.stopCh:
-				return
-			case <-ticker.C:
-				_ = hp.SendProbe()
-			}
-		}
-	}()
-}
-
-// SendBurstProbes is a standalone helper that sends a burst of CmdStunProbe packets
-// to a specific target address. Useful for immediate punch reactions on server and client.
-func SendBurstProbes(conn *net.UDPConn, target *net.UDPAddr, sessionID uint64, count int, interval time.Duration) {
-	if conn == nil || target == nil || count <= 0 {
+	if hp == nil {
 		return
 	}
-	pkt := protocol.NewPacket(protocol.CmdStunProbe, sessionID, 0, []byte("PUNCH"))
-	data := pkt.Marshal()
-	for i := 0; i < count; i++ {
-		_, _ = conn.WriteToUDP(data, target)
-		if i+1 < count && interval > 0 {
-			time.Sleep(interval)
-		}
+	if interval <= 0 {
+		interval = 3 * time.Second
 	}
+	hp.startOnce.Do(func() {
+		select {
+		case <-hp.stopCh:
+			return
+		default:
+		}
+		hp.wg.Add(1)
+		go func() {
+			defer hp.wg.Done()
+			// Fast burst to open hole immediately
+			hp.SendBurst(5, 25*time.Millisecond)
+
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hp.stopCh:
+					return
+				case <-ticker.C:
+					_ = hp.SendProbe()
+				}
+			}
+		}()
+	})
 }
 
-
-// SendProbe transmits a single UDP STUN probe packet.
-//
-// The candidate socket is created with net.DialUDP (connected), so we must use
-// conn.Write (which sends to the connected peer) — calling conn.WriteToUDP on a
-// connected socket fails with "use of WriteTo with pre-connected connection"
-// and silently drops every probe. The punch socket is the opposite: it is
-// unconnected (net.ListenUDP) and must use WriteToUDP to reach the server's
-// public endpoint.
+// SendProbe transmits one probe through the authenticated client callback.
 func (hp *HolePuncher) SendProbe() error {
 	hp.mu.Lock()
-	conn := hp.conn
-	sendTo := hp.sendTo
+	secureSend := hp.secureSend
+	hp.mu.Unlock()
+	if secureSend == nil {
+		return fmt.Errorf("hole puncher authenticated sender is not configured")
+	}
+	if err := secureSend(); err != nil {
+		return err
+	}
+	hp.mu.Lock()
 	first := !hp.probeLogged
 	hp.probeLogged = true
 	hp.mu.Unlock()
-
-	if conn == nil {
-		return fmt.Errorf("hole puncher connection is nil")
-	}
-
-	pkt := protocol.NewPacket(protocol.CmdStunProbe, hp.sessionID, 0, []byte("PUNCH"))
-	data := pkt.Marshal()
-	var err error
-	if sendTo != nil {
-		_, err = conn.WriteToUDP(data, sendTo)
-	} else {
-		_, err = conn.Write(data)
-	}
-	if err != nil {
-		log.Printf("[Client] STUN probe SEND FAILED from %s: %v", conn.LocalAddr(), err)
-		return err
-	}
 	if first {
-		target := "?"
-		if sendTo != nil {
-			target = sendTo.String()
-		} else if conn.RemoteAddr() != nil {
-			target = conn.RemoteAddr().String()
-		}
-		log.Printf("[Client] STUN probe OK -> %s from %s (sessionID=%d)", target, conn.LocalAddr(), hp.sessionID)
+		log.Printf("[Client] Authenticated STUN probe sent (sessionID=%d)", hp.sessionID)
 	}
 	return nil
 }
@@ -146,9 +137,9 @@ func (hp *HolePuncher) Retarget(conn *net.UDPConn, sendTo *net.UDPAddr) {
 
 // Stop halts the hole puncher.
 func (hp *HolePuncher) Stop() {
-	select {
-	case <-hp.stopCh:
-	default:
-		close(hp.stopCh)
+	if hp == nil {
+		return
 	}
+	hp.stopOnce.Do(func() { close(hp.stopCh) })
+	hp.wg.Wait()
 }

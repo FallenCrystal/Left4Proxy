@@ -17,6 +17,7 @@ func TestStunReflectionRoundTrip(t *testing.T) {
 	serverCfg := config.DefaultServerConfig()
 	serverCfg.ListenAddr = "127.0.0.1:28115"
 	serverCfg.TargetAddr = "127.0.0.1:28116" // dummy upstream, never used
+	serverCfg.AuthKey = integrationKey()
 	srv, err := server.NewServer(serverCfg)
 	if err != nil {
 		t.Fatalf("failed to create server: %v", err)
@@ -30,6 +31,7 @@ func TestStunReflectionRoundTrip(t *testing.T) {
 	clientCfg.ServerAddrs = []string{"127.0.0.1:28115"}
 	clientCfg.ListenAddr = "127.0.0.1:28117"
 	clientCfg.EnablePunch = true
+	clientCfg.AuthKey = serverCfg.AuthKey
 	cli, err := NewClient(clientCfg)
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)

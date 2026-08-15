@@ -40,19 +40,20 @@ func DetectNATMapping(ctx context.Context, conn *net.UDPConn, server1, server2 *
 	if server1 == nil || server2 == nil {
 		return nil, errors.New("two distinct STUN server addresses are required")
 	}
+	if sameUDPAddr(server1, server2) {
+		return nil, errors.New("two distinct STUN server addresses are required")
+	}
 
 	info := &NATMappingInfo{
 		Behavior: MappingUnknown,
 	}
 
-	req1 := BuildBindingRequest()
-	req2 := BuildBindingRequest()
-
-	// Send requests to both STUN servers
-	if _, err := conn.WriteToUDP(req1, server1); err != nil {
+	validator := NewValidator()
+	// Send independently identified requests to both STUN servers.
+	if err := validator.SendBindingRequest(conn, server1); err != nil {
 		return nil, fmt.Errorf("failed to send STUN request to server 1: %w", err)
 	}
-	if _, err := conn.WriteToUDP(req2, server2); err != nil {
+	if err := validator.SendBindingRequest(conn, server2); err != nil {
 		return nil, fmt.Errorf("failed to send STUN request to server 2: %w", err)
 	}
 
@@ -72,20 +73,15 @@ func DetectNATMapping(ctx context.Context, conn *net.UDPConn, server1, server2 *
 			continue
 		}
 
-		if !IsStunResponse(buf[:n]) {
-			continue
-		}
-
-		reflected, err := ParseBindingResponse(buf[:n])
+		validated, err := validator.Accept(buf[:n], src)
 		if err != nil {
 			continue
 		}
 
-		// Match source with server1 or server2
-		if src.IP.Equal(server1.IP) && src.Port == server1.Port {
-			info.PrimaryAddr = reflected
-		} else if src.IP.Equal(server2.IP) && src.Port == server2.Port {
-			info.SecondaryAddr = reflected
+		if sameUDPAddr(src, server1) {
+			info.PrimaryAddr = validated.Reflected
+		} else if sameUDPAddr(src, server2) {
+			info.SecondaryAddr = validated.Reflected
 		}
 
 		if info.PrimaryAddr != nil && info.SecondaryAddr != nil {
@@ -137,14 +133,38 @@ func DetectClientNAT(ctx context.Context, customStunServer string, timeout time.
 	defer conn.Close()
 
 	if len(addrs) == 1 {
-		return DetectNATMapping(ctx, conn, addrs[0], addrs[0], timeout)
+		// With one reachable STUN server we can still report a validated single
+		// reflection, but mapping behavior is necessarily unknown. Do not send
+		// two transactions to the same destination and pretend they are distinct
+		// observations.
+		validator := NewValidator()
+		if err := validator.SendBindingRequest(conn, addrs[0]); err != nil {
+			return nil, fmt.Errorf("failed to send STUN request: %w", err)
+		}
+		deadline := time.Now().Add(timeout)
+		buf := make([]byte, 2048)
+		for time.Now().Before(deadline) {
+			select {
+			case <-ctx.Done():
+				return &NATMappingInfo{Behavior: MappingUnknown}, ctx.Err()
+			default:
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, src, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			validated, err := validator.Accept(buf[:n], src)
+			if err != nil {
+				continue
+			}
+			return &NATMappingInfo{Behavior: MappingUnknown, PrimaryAddr: validated.Reflected}, nil
+		}
+		return &NATMappingInfo{Behavior: MappingUnknown}, errors.New("no STUN response received from server")
 	}
 
-	// Send requests to all resolved STUN servers
-	req := BuildBindingRequest()
-	for _, addr := range addrs {
-		_, _ = conn.WriteToUDP(req, addr)
-	}
+	validator := NewValidator()
+	_ = validator.SendMultiBindingRequests(conn, addrs)
 
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 2048)
@@ -163,16 +183,12 @@ func DetectClientNAT(ctx context.Context, customStunServer string, timeout time.
 			continue
 		}
 
-		if !IsStunResponse(buf[:n]) {
-			continue
-		}
-
-		reflected, err := ParseBindingResponse(buf[:n])
+		validated, err := validator.Accept(buf[:n], src)
 		if err != nil {
 			continue
 		}
 
-		reflections[src.String()] = reflected
+		reflections[validated.Server.String()] = validated.Reflected
 		if len(reflections) >= 2 {
 			break
 		}

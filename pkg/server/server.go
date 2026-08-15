@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"left4proxy/pkg/discover"
 	"left4proxy/pkg/protocol"
 	"left4proxy/pkg/proxyproto"
+	"left4proxy/pkg/security"
 	"left4proxy/pkg/stun"
 )
 
@@ -24,10 +26,12 @@ const maxSessions = 2048
 
 // clientSession tracks one client's state on the server.
 type clientSession struct {
-	mu             sync.RWMutex // Guards rawSenderAddr / realClientAddr / lastActive / punchTarget.
+	mu             sync.RWMutex // Guards addresses / lastActive / punchTarget.
 	sessionID      uint64
 	rawSenderAddr  *net.UDPAddr // Socket return path (frpc or direct UDP client)
 	realClientAddr *net.UDPAddr // Extracted real client public IP:Port (from PROXY protocol or direct)
+	allowedSenders map[string]struct{}
+	secure         *security.Session
 	lastActive     time.Time
 	punchTarget    *net.UDPAddr // Client's punch-socket public endpoint (from CmdPunchInit); probed to open the server-side hole.
 	punchExpiry    time.Time    // When to stop probing the punch target.
@@ -42,6 +46,13 @@ type proxyAddrEntry struct {
 	ts   time.Time
 }
 
+type handshakeCacheEntry struct {
+	response  []byte
+	client    *clientSession
+	clientPub []byte
+	created   time.Time
+}
+
 // Server is the Left4Proxy server daemon.
 type Server struct {
 	cfg               *config.ServerConfig
@@ -51,10 +62,14 @@ type Server struct {
 	stunProbeLogged   map[string]bool            // Dedup so only the first STUN probe per sender is logged.
 	proxyAddrMu       sync.RWMutex
 	sessionMu         sync.RWMutex
-	serverPubMu       sync.RWMutex // Guards serverPublic and upnpCleanup.
-	serverPublic      *net.UDPAddr // The server's NAT-mapped public endpoint (advertised so clients can punch to it).
-	upnpCleanup       func()       // Optional UPnP port mapping release callback.
+	serverPubMu       sync.RWMutex   // Guards serverPublic and upnpCleanup.
+	serverPublic      *net.UDPAddr   // The server's NAT-mapped public endpoint (advertised so clients can punch to it).
+	upnpCleanup       func()         // Optional UPnP port mapping release callback.
 	stunAddrs         []*net.UDPAddr // Resolved public STUN servers for multi-STUN racing.
+	stunValidator     *stun.Validator
+	authKey           []byte
+	handshakeMu       sync.Mutex
+	handshakes        map[string]*handshakeCacheEntry
 	nextID            uint64
 	behindNAT         bool // Whether the server has no public interface IP (for direct vs punch labeling).
 	ctx               context.Context
@@ -64,25 +79,34 @@ type Server struct {
 
 // NewServer creates a new Server instance.
 func NewServer(cfg *config.ServerConfig) (*Server, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("server configuration is nil")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		cfg:               cfg,
 		sessions:          make(map[uint64]*clientSession),
 		pendingProxyAddrs: make(map[string]*proxyAddrEntry),
 		stunProbeLogged:   make(map[string]bool),
+		stunValidator:     stun.NewValidator(),
+		authKey:           append([]byte(nil), cfg.AuthKey...),
+		handshakes:        make(map[string]*handshakeCacheEntry),
 		// Seed the session ID counter randomly. After a server restart the counter
 		// must NOT restart from 0, otherwise a freshly-connected client could be
 		// assigned an ID that a client from before the restart is still using, and
 		// the two sessions would collide on the server.
-		nextID:     rand.Uint64(),
-		behindNAT:  determineBehindNAT(cfg.NAT),
-		ctx:        ctx,
-		cancel:     cancel,
+		nextID:    rand.Uint64(),
+		behindNAT: determineBehindNAT(cfg.NAT),
+		ctx:       ctx,
+		cancel:    cancel,
 	}, nil
 }
 
 // Start launches the UDP listener and packet processing routines.
 func (s *Server) Start() error {
+	if len(s.authKey) != security.KeySize {
+		return fmt.Errorf("server authentication key is missing or invalid; load the shared .secret file before starting")
+	}
 	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve server UDP listen addr %s: %w", s.cfg.ListenAddr, err)
@@ -105,7 +129,9 @@ func (s *Server) Start() error {
 	}
 
 	// Attempt UPnP IGD automatic port mapping in background
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		port := udpAddr.Port
 		if port > 0 {
 			extAddr, cleanup := discover.TryUPnPMapping(s.ctx, port, "Left4Proxy Server")
@@ -158,43 +184,26 @@ func (s *Server) readUDPDataLoop() {
 
 		packetData := buf[:n]
 
-		// A STUN Binding Response from the public STUN server reveals this
-		// socket's NAT-mapped public endpoint (what clients should punch to).
-		// It is not an L4DP packet, so handle it and move on.
-		if stun.IsStunResponse(packetData) {
-			if addr, perr := stun.ParseBindingResponse(packetData); perr == nil {
-				s.updateServerPublic(addr)
-			}
+		// A STUN response is trusted only when it matches a request issued from
+		// this exact socket to this exact STUN server.  A magic cookie alone is
+		// not authentication and must never update the advertised endpoint.
+		if validated, verr := s.stunValidator.Accept(packetData, rawSenderAddr); verr == nil {
+			s.updateServerPublic(validated.Reflected)
 			continue
 		}
 
 		realClientAddr := rawSenderAddr
+		var proxyHeaderAddr *net.UDPAddr
 
 		// If ProxyProtocol is enabled on server, parse incoming PROXY protocol v1/v2 header from frp/HAProxy
 		if s.cfg.ProxyProtocolV2 {
 			extractedAddr, offset, pErr := proxyproto.ParseHeader(packetData)
 			if pErr == nil && extractedAddr != nil {
-				log.Printf("[Server] [PROXY Protocol Detected] Extracted Real Client Endpoint: %s (Raw Sender: %s)",
-					extractedAddr.String(), rawSenderAddr.String())
-
-				// Cache the mapping so subsequent packets without a header (some
-				// fronting proxies only prepend it on the first datagram) still get the
-				// real source address. Bound the map so forged headers cannot grow it unboundedly.
-				s.proxyAddrMu.Lock()
-				s.pendingProxyAddrs[rawSenderAddr.String()] = &proxyAddrEntry{addr: extractedAddr, ts: time.Now()}
-				if len(s.pendingProxyAddrs) > 4096 {
-					var oldestKey string
-					var oldest time.Time
-					for k, e := range s.pendingProxyAddrs {
-						if oldestKey == "" || e.ts.Before(oldest) {
-							oldestKey, oldest = k, e.ts
-						}
-					}
-					delete(s.pendingProxyAddrs, oldestKey)
-				}
-				s.proxyAddrMu.Unlock()
-
-				realClientAddr = extractedAddr
+				// Do not cache an asserted PROXY address yet. The encapsulated
+				// handshake must authenticate first; otherwise anyone able to reach
+				// this UDP port could poison path classification and reflected IPs.
+				proxyHeaderAddr = cloneUDPAddr(extractedAddr)
+				realClientAddr = proxyHeaderAddr
 				packetData = packetData[offset:]
 			} else {
 				// Headerless packet from a known tunnel: reuse the cached real
@@ -218,9 +227,58 @@ func (s *Server) readUDPDataLoop() {
 		if err != nil {
 			continue
 		}
+		if proxyHeaderAddr != nil {
+			if pkt.Cmd != protocol.CmdHandshakeReq {
+				// A tunnel mapping is established only by an authenticated
+				// handshake. Later header-bearing packets reuse that mapping rather
+				// than accepting an unverified address change.
+				s.proxyAddrMu.Lock()
+				entry := s.pendingProxyAddrs[rawSenderAddr.String()]
+				if entry != nil {
+					// Header-bearing packets are still bound to the address learned
+					// by the authenticated handshake, but active traffic must keep
+					// that mapping alive instead of letting it expire after 60s.
+					entry.ts = time.Now()
+				}
+				s.proxyAddrMu.Unlock()
+				if entry == nil {
+					continue
+				}
+				realClientAddr = entry.addr
+			} else {
+				if _, err := security.VerifyHandshakeRequest(s.authKey, pkt, time.Now().UnixNano()); err != nil {
+					continue
+				}
+				s.cacheProxyAddress(rawSenderAddr, proxyHeaderAddr)
+				log.Printf("[Server] [Authenticated PROXY Protocol] Real Client Endpoint: %s (Raw Sender: %s)",
+					proxyHeaderAddr, rawSenderAddr)
+			}
+		}
 
-		s.handlePacket(pkt, rawSenderAddr, realClientAddr)
+		s.handlePacket(packetData, pkt, rawSenderAddr, realClientAddr)
 	}
+}
+
+func (s *Server) cacheProxyAddress(rawSenderAddr, realClientAddr *net.UDPAddr) {
+	if rawSenderAddr == nil || realClientAddr == nil {
+		return
+	}
+	s.proxyAddrMu.Lock()
+	s.pendingProxyAddrs[rawSenderAddr.String()] = &proxyAddrEntry{addr: cloneUDPAddr(realClientAddr), ts: time.Now()}
+	if len(s.pendingProxyAddrs) > 4096 {
+		var oldestKey string
+		var oldest time.Time
+		for key, entry := range s.pendingProxyAddrs {
+			if entry == nil || oldestKey == "" || entry.ts.Before(oldest) {
+				oldestKey = key
+				if entry != nil {
+					oldest = entry.ts
+				}
+			}
+		}
+		delete(s.pendingProxyAddrs, oldestKey)
+	}
+	s.proxyAddrMu.Unlock()
 }
 
 // publicEndpointString returns the server's known public punch endpoint, or ""
@@ -238,6 +296,10 @@ func (s *Server) publicEndpointString() string {
 // pushes a CmdPunchOffer to every live session so already-connected clients can
 // start punching.
 func (s *Server) updateServerPublic(addr *net.UDPAddr) {
+	if addr == nil || addr.IP == nil || addr.Port == 0 {
+		return
+	}
+	addr = cloneUDPAddr(addr)
 	s.serverPubMu.Lock()
 	changed := s.serverPublic == nil || s.serverPublic.String() != addr.String()
 	if changed {
@@ -258,8 +320,6 @@ func (s *Server) broadcastPunchOffer() {
 	if offer == "" {
 		return
 	}
-	pkt := protocol.NewPacket(protocol.CmdPunchOffer, 0, 0, []byte(offer))
-	data := pkt.Marshal()
 
 	s.sessionMu.RLock()
 	defer s.sessionMu.RUnlock()
@@ -268,9 +328,37 @@ func (s *Server) broadcastPunchOffer() {
 		dst := sess.rawSenderAddr
 		sess.mu.RUnlock()
 		if dst != nil {
-			_, _ = s.udpConn.WriteToUDP(data, dst)
+			_ = s.sendSessionPacket(sess, protocol.CmdPunchOffer, []byte(offer), dst)
 		}
 	}
+}
+
+// sendSessionPacket is the only server-side path for post-handshake packets.
+// It assigns a fresh direction-local sequence and seals the complete packet
+// before writing it to the currently authenticated return address.
+func (s *Server) sendSessionPacket(sess *clientSession, cmd byte, payload []byte, dst *net.UDPAddr) error {
+	return s.sendSessionPacketAt(sess, cmd, payload, dst, time.Now().UnixNano())
+}
+
+// sendSessionPacketAt is used for authenticated request/response probes whose
+// request timestamp must be echoed verbatim so the client can calculate RTT
+// without depending on synchronized clocks.
+func (s *Server) sendSessionPacketAt(sess *clientSession, cmd byte, payload []byte, dst *net.UDPAddr, timestamp int64) error {
+	if sess == nil || dst == nil || sess.secure == nil || s.udpConn == nil {
+		return fmt.Errorf("secure session or destination is unavailable")
+	}
+	seq, err := sess.secure.NextSeq()
+	if err != nil {
+		return err
+	}
+	pkt := protocol.NewPacket(cmd, sess.sessionID, seq, payload)
+	pkt.Timestamp = timestamp
+	data, err := sess.secure.Seal(pkt, security.ServerToClient)
+	if err != nil {
+		return err
+	}
+	_, err = s.udpConn.WriteToUDP(data, dst)
+	return err
 }
 
 // sendStunBindingRequest sends STUN Binding Requests to resolved STUN servers in parallel
@@ -289,7 +377,9 @@ func (s *Server) sendStunBindingRequest() {
 		}
 		log.Printf("[Server] Resolved %d public STUN servers for endpoint discovery and racing", len(s.stunAddrs))
 	}
-	stun.SendMultiBindingRequests(s.udpConn, s.stunAddrs)
+	if err := s.stunValidator.SendMultiBindingRequests(s.udpConn, s.stunAddrs); err != nil {
+		log.Printf("[Server] STUN request send error: %v", err)
+	}
 }
 
 // discoverPublicEndpointLoop determines the server's public punch endpoint. If
@@ -334,9 +424,6 @@ func (s *Server) discoverPublicEndpointLoop() {
 // NATs. Stops once the punch expires or the server is shutting down.
 func (s *Server) punchProbeLoop(sess *clientSession, target *net.UDPAddr) {
 	defer s.wg.Done()
-	probe := protocol.NewPacket(protocol.CmdStunProbe, sess.sessionID, 0, []byte("PUNCH"))
-	data := probe.Marshal()
-
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -351,7 +438,9 @@ func (s *Server) punchProbeLoop(sess *clientSession, target *net.UDPAddr) {
 		if expired {
 			return
 		}
-		_, _ = s.udpConn.WriteToUDP(data, target)
+		if err := s.sendSessionPacket(sess, protocol.CmdStunProbe, []byte("PUNCH"), target); err != nil {
+			return
+		}
 	}
 }
 
@@ -420,7 +509,7 @@ func hasPublicInterfaceIP() bool {
 //	         (client got in via a NAT mapping / hole punch / port-forward)
 //	direct — direct arrival from a public client to a public (non-NAT) server
 func (s *Server) classifyPath(rawSenderAddr, realClientAddr *net.UDPAddr) string {
-	if s.cfg.ProxyProtocolV2 {
+	if s.cfg.ProxyProtocolV2 && rawSenderAddr != nil {
 		s.proxyAddrMu.RLock()
 		_, tunneled := s.pendingProxyAddrs[rawSenderAddr.String()]
 		s.proxyAddrMu.RUnlock()
@@ -437,82 +526,59 @@ func (s *Server) classifyPath(rawSenderAddr, realClientAddr *net.UDPAddr) string
 	return "direct"
 }
 
-// handlePacket processes unmarshaled protocol packets.
-func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAddr *net.UDPAddr) {
+// handlePacket authenticates a wire packet before dispatching it.  Handshake
+// requests are the only clear packets; all other commands must belong to an
+// existing secure session.
+func (s *Server) handlePacket(wire []byte, pkt *protocol.Packet, rawSenderAddr, realClientAddr *net.UDPAddr) {
+	if pkt == nil || rawSenderAddr == nil {
+		return
+	}
+	if pkt.Cmd == protocol.CmdHandshakeReq {
+		s.handleHandshake(pkt, rawSenderAddr, realClientAddr)
+		return
+	}
+	s.sessionMu.RLock()
+	sess := s.sessions[pkt.SessionID]
+	s.sessionMu.RUnlock()
+	if sess == nil || sess.secure == nil {
+		return
+	}
+	authorizedSource := s.sessionAllowsSource(sess, rawSenderAddr)
+	// Once an authenticated PunchInit has opened the migration window, allow
+	// the first valid AEAD packet from the NAT's actual mapped source even when
+	// it differs from the STUN-reflected address (symmetric NATs can do this).
+	// A fresh authenticated Ping is also a path-binding request: it lets a
+	// candidate socket join an existing session without minting a new session
+	// (important when several relay/direct addresses front the same server).
+	// The packet is still authenticated before the new address is retained.
+	if !authorizedSource && pkt.Cmd != protocol.CmdPing && !s.sessionAllowsPunchMigration(sess) {
+		return
+	}
+	opened, err := sess.secure.Open(wire, security.ClientToServer)
+	if err != nil {
+		return
+	}
+	pkt = opened
+	if !authorizedSource && pkt.Cmd != protocol.CmdPing && !s.sessionAllowsPunchMigration(sess) {
+		return
+	}
+	// Every valid packet keeps the session alive and authorizes this source for
+	// future packets. Only game data (or the initial handshake) changes the
+	// upstream return path; background pings from alternative candidates must
+	// not make server replies leak out of the route selected by relay-only.
+	s.authorizeSessionSource(sess, rawSenderAddr, realClientAddr)
+
 	switch pkt.Cmd {
 	case protocol.CmdHandshakeReq:
-		sid := atomic.AddUint64(&s.nextID, 1)
-		_ = s.getOrCreateSession(sid, rawSenderAddr, realClientAddr)
-
-		reflected := stun.ReflectAddress(realClientAddr)
-		// Tell the client how this connection reached us (relay/direct/punch/lan)
-		// so it can label the candidate honestly instead of guessing.
-		pathHint := s.classifyPath(rawSenderAddr, realClientAddr)
-
-		// Collect configured public IPs as well as auto-discovered LAN and IPv6 host candidates (if listening on wildcard)
-		listenPort := 27014
-		if s.udpConn != nil {
-			if lAddr, ok := s.udpConn.LocalAddr().(*net.UDPAddr); ok && lAddr.Port > 0 {
-				listenPort = lAddr.Port
-			}
-		}
-		var localCandidates []string
-		if isWildcardListenAddr(s.cfg.ListenAddr) {
-			localCandidates = discover.GatherAllLocalCandidates(listenPort)
-		}
-		var combinedIPs []string
-		seenAddrs := make(map[string]bool)
-		for _, a := range s.cfg.PublicIPs {
-			a = strings.TrimSpace(a)
-			if a != "" && !seenAddrs[a] {
-				seenAddrs[a] = true
-				combinedIPs = append(combinedIPs, a)
-			}
-		}
-		for _, a := range localCandidates {
-			if !seenAddrs[a] {
-				seenAddrs[a] = true
-				combinedIPs = append(combinedIPs, a)
-			}
-		}
-
-		var respPayload string
-		if len(combinedIPs) > 0 {
-			respPayload = fmt.Sprintf("%s|%s|%s", reflected, strings.Join(combinedIPs, ","), pathHint)
-		} else {
-			respPayload = fmt.Sprintf("%s||%s", reflected, pathHint)
-		}
-		// 4th field: the server's public punch endpoint, when known. Old clients
-		// read only the first three fields and ignore this; new clients use it to
-		// establish a direct (punched) path.
-		if sp := s.publicEndpointString(); sp != "" {
-			respPayload += "|" + sp
-		}
-
-		// Echo back client's sent timestamp for instant RTT calculation during handshake
-		respPkt := &protocol.Packet{
-			Version:   protocol.Version1,
-			Cmd:       protocol.CmdHandshakeResp,
-			SessionID: sid,
-			Seq:       pkt.Seq,
-			Timestamp: pkt.Timestamp, // Echo back client's sent timestamp!
-			Payload:   []byte(respPayload),
-		}
-
-		// Send UDP response back to rawSenderAddr (the frp tunnel return socket!)
-		_, _ = s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
-
-		log.Printf("[Server] Client Handshake accepted (SessionID: %d, Real Client Endpoint: %s, Socket Sender: %s, Path: %s)",
-			sid, realClientAddr.String(), rawSenderAddr.String(), pathHint)
+		// Handshake requests return from the authenticated prelude above.
+		return
 
 	case protocol.CmdLanProbe:
-		respPkt := protocol.NewPacket(protocol.CmdLanAck, pkt.SessionID, pkt.Seq, []byte("LAN_ACK"))
-		_, _ = s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
+		_ = s.sendSessionPacket(sess, protocol.CmdLanAck, []byte("LAN_ACK"), rawSenderAddr)
 
 	case protocol.CmdStunProbe:
-		respPayload := []byte(stun.ReflectAddress(realClientAddr))
-		respPkt := protocol.NewPacket(protocol.CmdStunAck, pkt.SessionID, pkt.Seq, respPayload)
-		_, wErr := s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
+		respPayload := []byte(reflectAddress(realClientAddr))
+		wErr := s.sendSessionPacket(sess, protocol.CmdStunAck, respPayload, rawSenderAddr)
 
 		// Log only the first probe per tunnel sender so STUN keepalives don't
 		// spam the server log every few seconds.
@@ -533,30 +599,28 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		// over the control (relay) channel and start probing the target, which
 		// creates the server-side NAT mapping that lets the client's direct
 		// packets through even on restricted-cone NATs.
-		if pkt.SessionID == 0 {
-			return
-		}
 		target, perr := stun.ParseReflectedAddress(string(pkt.Payload))
-		if perr != nil || target == nil {
+		if perr != nil || target == nil || target.Port == 0 {
 			log.Printf("[Server] Bad PunchInit payload %q: %v", pkt.Payload, perr)
-			return
-		}
-		s.sessionMu.RLock()
-		sess := s.sessions[pkt.SessionID]
-		s.sessionMu.RUnlock()
-		if sess == nil {
 			return
 		}
 		sess.mu.Lock()
 		sess.punchTarget = target
 		sess.punchExpiry = time.Now().Add(30 * time.Second)
+		if sess.allowedSenders == nil {
+			sess.allowedSenders = make(map[string]struct{})
+		}
+		sess.allowedSenders[target.String()] = struct{}{}
 		sess.mu.Unlock()
-		ack := protocol.NewPacket(protocol.CmdPunchAck, pkt.SessionID, pkt.Seq, []byte("PUNCH_INIT_OK"))
-		_, _ = s.udpConn.WriteToUDP(ack.Marshal(), rawSenderAddr)
+		_ = s.sendSessionPacket(sess, protocol.CmdPunchAck, []byte("PUNCH_INIT_OK"), rawSenderAddr)
 		log.Printf("[Server] PunchInit (sid=%d) target %s via sender %s", pkt.SessionID, target, rawSenderAddr)
 
 		// Immediately fire a fast burst of 5 probes to establish server-side NAT mapping with minimal latency
-		go stun.SendBurstProbes(s.udpConn, target, pkt.SessionID, 5, 25*time.Millisecond)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.sendSecureProbeBurst(sess, target, 5, 25*time.Millisecond)
+		}()
 
 		s.wg.Add(1)
 		go s.punchProbeLoop(sess, target)
@@ -565,26 +629,11 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 		// Keep idle-but-alive sessions (and their stable upstream socket) from being
 		// reaped, otherwise a re-dialed upstream would change the source port the
 		// L4D2 server sees and disconnect the player.
-		if pkt.SessionID != 0 {
-			s.sessionMu.RLock()
-			if sess := s.sessions[pkt.SessionID]; sess != nil {
-				sess.mu.Lock()
-				sess.lastActive = time.Now()
-				sess.mu.Unlock()
-			}
-			s.sessionMu.RUnlock()
+		pathPayload := protocol.EncodePathHint(s.classifyPath(rawSenderAddr, realClientAddr))
+		if pathPayload == nil {
+			return
 		}
-
-		// Echo back client's sent timestamp for accurate RTT calculation
-		respPkt := &protocol.Packet{
-			Version:   protocol.Version1,
-			Cmd:       protocol.CmdPong,
-			SessionID: pkt.SessionID,
-			Seq:       pkt.Seq,
-			Timestamp: pkt.Timestamp, // Echo back client's timestamp
-			Payload:   pkt.Payload,
-		}
-		_, _ = s.udpConn.WriteToUDP(respPkt.Marshal(), rawSenderAddr)
+		_ = s.sendSessionPacketAt(sess, protocol.CmdPong, pathPayload, rawSenderAddr, pkt.Timestamp)
 
 	case protocol.CmdPunchOffer, protocol.CmdPunchAck:
 		// The server never sends itself a PunchOffer and only receives a
@@ -593,24 +642,270 @@ func (s *Server) handlePacket(pkt *protocol.Packet, rawSenderAddr, realClientAdd
 	case protocol.CmdData:
 		// A zero session ID means the client hasn't completed its handshake yet.
 		// Accepting it here would merge every pre-handshake client into one session.
-		if pkt.SessionID == 0 || !protocol.IsL4D2Packet(pkt.Payload) {
+		if !protocol.IsL4D2Packet(pkt.Payload) {
 			return
 		}
+		// The path carrying actual game traffic is the only one allowed to
+		// become the upstream response destination.
+		s.setSessionReturnPath(sess, rawSenderAddr, realClientAddr)
+		sess.mu.Lock()
+		// Direct data from the punch socket proves migration succeeded; stop
+		// hole-opening probes while retaining the authorized source.
+		if sess.punchTarget != nil && sameUDPAddr(sess.punchTarget, rawSenderAddr) {
+			sess.punchExpiry = time.Now()
+		}
+		sess.mu.Unlock()
+		s.forwardToUpstream(sess, pkt.Payload)
+	}
+}
 
-		sess := s.getOrCreateSession(pkt.SessionID, rawSenderAddr, realClientAddr)
-		if sess != nil {
-			sess.mu.Lock()
-			sess.lastActive = time.Now()
-			// Direct data from the punch socket means migration happened — stop
-			// the server-side hole-opening probes (the direct path now carries
-			// the data and our replies keep the mapping alive).
-			if sess.punchTarget != nil && sess.punchTarget.IP.Equal(rawSenderAddr.IP) && sess.punchTarget.Port == rawSenderAddr.Port {
-				sess.punchExpiry = time.Now()
+func (s *Server) sessionAllowsPunchMigration(sess *clientSession) bool {
+	if sess == nil {
+		return false
+	}
+	sess.mu.RLock()
+	allowed := sess.punchTarget != nil && time.Now().Before(sess.punchExpiry)
+	sess.mu.RUnlock()
+	return allowed
+}
+
+func (s *Server) handleHandshake(pkt *protocol.Packet, rawSenderAddr, realClientAddr *net.UDPAddr) {
+	if rawSenderAddr == nil {
+		return
+	}
+	req, err := security.VerifyHandshakeRequest(s.authKey, pkt, time.Now().UnixNano())
+	if err != nil {
+		return
+	}
+	cacheKey := string(req.ClientNonce[:])
+	clientPub := req.ClientPublic.Bytes()
+	now := time.Now()
+
+	s.handshakeMu.Lock()
+	if entry := s.handshakes[cacheKey]; entry != nil {
+		if now.Sub(entry.created) > 2*time.Minute {
+			delete(s.handshakes, cacheKey)
+		} else {
+			// A nonce is bound to the ephemeral client public key.  Reusing the
+			// nonce with a different key must not replace the cached session or
+			// let an attacker force session confusion.
+			if !bytes.Equal(entry.clientPub, clientPub) {
+				s.handshakeMu.Unlock()
+				return
 			}
-			sess.mu.Unlock()
-			s.forwardToUpstream(sess, pkt.Payload)
+			if entry.client == nil || entry.client.secure == nil || !s.sessionPresent(entry.client) {
+				delete(s.handshakes, cacheKey)
+			} else {
+				s.handshakeMu.Unlock()
+				// Do not authorize a new source merely because it replayed a
+				// previously authenticated handshake.  A captured handshake can be
+				// replayed by an observer that does not possess the ephemeral private
+				// key; the candidate must first prove possession with a fresh AEAD
+				// Ping, which handlePacket deliberately permits for a new source.
+				// This also keeps a retransmission from changing the real-client
+				// address used by the established session.
+				_, _ = s.udpConn.WriteToUDP(entry.response, rawSenderAddr)
+				return
+			}
 		}
 	}
+
+	sid := s.nextSessionID()
+	metadata := s.handshakeMetadata(rawSenderAddr, realClientAddr)
+	respPkt, secureSession, err := security.NewHandshakeResponse(s.authKey, req, sid, metadata)
+	if err != nil {
+		s.handshakeMu.Unlock()
+		return
+	}
+	sess := &clientSession{
+		sessionID:      sid,
+		rawSenderAddr:  cloneUDPAddr(rawSenderAddr),
+		realClientAddr: cloneUDPAddr(realClientAddr),
+		lastActive:     now,
+		secure:         secureSession,
+		allowedSenders: map[string]struct{}{rawSenderAddr.String(): {}},
+	}
+	s.sessionMu.Lock()
+	// Keep the session map bounded even when an attacker submits many valid
+	// handshakes with a compromised key.
+	if len(s.sessions) >= maxSessions {
+		s.evictOldestSessionLocked()
+	}
+	s.sessions[sid] = sess
+	s.sessionMu.Unlock()
+	response := respPkt.Marshal()
+	if len(s.handshakes) >= maxSessions*2 {
+		var oldestKey string
+		var oldestTime time.Time
+		for key, entry := range s.handshakes {
+			if entry == nil || oldestKey == "" || entry.created.Before(oldestTime) {
+				oldestKey = key
+				if entry != nil {
+					oldestTime = entry.created
+				}
+			}
+		}
+		delete(s.handshakes, oldestKey)
+	}
+	s.handshakes[cacheKey] = &handshakeCacheEntry{
+		response:  append([]byte(nil), response...),
+		client:    sess,
+		clientPub: append([]byte(nil), clientPub...),
+		created:   now,
+	}
+	s.handshakeMu.Unlock()
+
+	_, _ = s.udpConn.WriteToUDP(response, rawSenderAddr)
+	log.Printf("[Server] Client Handshake accepted (SessionID: %d, Real Client Endpoint: %s, Socket Sender: %s, Path: %s)",
+		sid, reflectAddress(realClientAddr), rawSenderAddr, s.classifyPath(rawSenderAddr, realClientAddr))
+}
+
+func (s *Server) sessionPresent(target *clientSession) bool {
+	if target == nil {
+		return false
+	}
+	s.sessionMu.RLock()
+	current := s.sessions[target.sessionID]
+	s.sessionMu.RUnlock()
+	return current == target && target.secure != nil && !target.secure.IsClosed()
+}
+
+func (s *Server) nextSessionID() uint64 {
+	for {
+		id := atomic.AddUint64(&s.nextID, 1)
+		if id == 0 {
+			continue
+		}
+		s.sessionMu.RLock()
+		_, exists := s.sessions[id]
+		s.sessionMu.RUnlock()
+		if !exists {
+			return id
+		}
+	}
+}
+
+func (s *Server) handshakeMetadata(rawSenderAddr, realClientAddr *net.UDPAddr) []byte {
+	reflected := reflectAddress(realClientAddr)
+	listenPort := 27014
+	if s.udpConn != nil {
+		if lAddr, ok := s.udpConn.LocalAddr().(*net.UDPAddr); ok && lAddr.Port > 0 {
+			listenPort = lAddr.Port
+		}
+	}
+	var localCandidates []string
+	if isWildcardListenAddr(s.cfg.ListenAddr) {
+		localCandidates = discover.GatherAllLocalCandidates(listenPort)
+	}
+	var combinedIPs []string
+	seenAddrs := make(map[string]bool)
+	for _, a := range s.cfg.PublicIPs {
+		a = strings.TrimSpace(a)
+		if a != "" && !seenAddrs[a] {
+			seenAddrs[a] = true
+			combinedIPs = append(combinedIPs, a)
+		}
+	}
+	for _, a := range localCandidates {
+		if !seenAddrs[a] {
+			seenAddrs[a] = true
+			combinedIPs = append(combinedIPs, a)
+		}
+	}
+	// The same authenticated handshake may be sent over several candidate
+	// sockets.  Path classification is therefore intentionally left blank here
+	// and learned with an authenticated per-candidate Ping/Pong exchange; a
+	// cached response must never make a direct candidate look like a relay (or
+	// vice versa).
+	resp := fmt.Sprintf("%s|%s|", reflected, strings.Join(combinedIPs, ","))
+	if sp := s.publicEndpointString(); sp != "" {
+		resp += "|" + sp
+	}
+	return []byte(resp)
+}
+
+func (s *Server) sessionAllowsSource(sess *clientSession, source *net.UDPAddr) bool {
+	if sess == nil || source == nil {
+		return false
+	}
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	if _, ok := sess.allowedSenders[source.String()]; ok {
+		return true
+	}
+	return sess.rawSenderAddr != nil && sameUDPAddr(sess.rawSenderAddr, source)
+}
+
+func (s *Server) authorizeSessionSource(sess *clientSession, rawSenderAddr, realClientAddr *net.UDPAddr) {
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	if rawSenderAddr != nil {
+		if sess.allowedSenders == nil {
+			sess.allowedSenders = make(map[string]struct{})
+		}
+		sess.allowedSenders[rawSenderAddr.String()] = struct{}{}
+	}
+	if realClientAddr != nil {
+		sess.realClientAddr = cloneUDPAddr(realClientAddr)
+	}
+	sess.lastActive = time.Now()
+	sess.mu.Unlock()
+}
+
+// setSessionReturnPath records the authenticated source that actually carried
+// game traffic.  It is deliberately separate from authorizeSessionSource so
+// control probes from non-selected candidates cannot redirect upstream replies.
+func (s *Server) setSessionReturnPath(sess *clientSession, rawSenderAddr, realClientAddr *net.UDPAddr) {
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	if rawSenderAddr != nil {
+		sess.rawSenderAddr = cloneUDPAddr(rawSenderAddr)
+		if sess.allowedSenders == nil {
+			sess.allowedSenders = make(map[string]struct{})
+		}
+		sess.allowedSenders[rawSenderAddr.String()] = struct{}{}
+	}
+	if realClientAddr != nil {
+		sess.realClientAddr = cloneUDPAddr(realClientAddr)
+	}
+	sess.lastActive = time.Now()
+	sess.mu.Unlock()
+}
+
+func (s *Server) sendSecureProbeBurst(sess *clientSession, target *net.UDPAddr, count int, interval time.Duration) {
+	if sess == nil || target == nil || count <= 0 {
+		return
+	}
+	for i := 0; i < count; i++ {
+		if err := s.sendSessionPacket(sess, protocol.CmdStunProbe, []byte("PUNCH"), target); err != nil {
+			return
+		}
+		if i+1 < count && interval > 0 {
+			time.Sleep(interval)
+		}
+	}
+}
+
+func reflectAddress(addr *net.UDPAddr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
+}
+
+func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), addr.IP...), Port: addr.Port, Zone: addr.Zone}
+}
+
+func sameUDPAddr(a, b *net.UDPAddr) bool {
+	return a != nil && b != nil && a.Port == b.Port && a.IP.Equal(b.IP)
 }
 
 // forwardToUpstream transmits L4D2 payload to upstream server target.
@@ -688,56 +983,36 @@ func (s *Server) readUpstreamLoop(sess *clientSession, upstream *net.UDPConn) {
 			continue
 		}
 
-		// Encapsulate in CmdData Left4Proxy packet and send back to client via rawSenderAddr
-		replyPkt := protocol.NewPacket(protocol.CmdData, sess.sessionID, 0, buf[:n])
-		_, _ = s.udpConn.WriteToUDP(replyPkt.Marshal(), dst)
+		// Encapsulate and authenticate the upstream response before sending it
+		// through the current relay or punched return path.
+		_ = s.sendSessionPacket(sess, protocol.CmdData, append([]byte(nil), buf[:n]...), dst)
 	}
 }
 
-// getOrCreateSession retrieves or initializes a client session.
-func (s *Server) getOrCreateSession(sessionID uint64, rawSenderAddr, realClientAddr *net.UDPAddr) *clientSession {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-
-	sess, exists := s.sessions[sessionID]
-	if !exists {
-		// Bound memory/socket usage: evict the oldest session when at capacity.
-		if len(s.sessions) >= maxSessions {
-			var oldest *clientSession
-			for _, existing := range s.sessions {
-				existing.mu.RLock()
-				if oldest == nil || existing.lastActive.Before(oldest.lastActive) {
-					oldest = existing
-				}
-				existing.mu.RUnlock()
-			}
-			if oldest != nil {
-				oldest.upstreamMu.Lock()
-				if oldest.upstream != nil {
-					_ = oldest.upstream.Close()
-				}
-				oldest.upstreamMu.Unlock()
-				delete(s.sessions, oldest.sessionID)
-				log.Printf("[Server] Session %d evicted (max sessions reached)", oldest.sessionID)
-			}
+// evictOldestSessionLocked removes one idle session. The caller must hold
+// sessionMu for writing.
+func (s *Server) evictOldestSessionLocked() {
+	var oldest *clientSession
+	for _, existing := range s.sessions {
+		existing.mu.RLock()
+		if oldest == nil || existing.lastActive.Before(oldest.lastActive) {
+			oldest = existing
 		}
-
-		sess = &clientSession{
-			sessionID:  sessionID,
-			lastActive: time.Now(),
-		}
-		s.sessions[sessionID] = sess
+		existing.mu.RUnlock()
 	}
-
-	sess.mu.Lock()
-	sess.rawSenderAddr = rawSenderAddr
-	if realClientAddr != nil {
-		sess.realClientAddr = realClientAddr
+	if oldest == nil {
+		return
 	}
-	sess.lastActive = time.Now()
-	sess.mu.Unlock()
-
-	return sess
+	oldest.upstreamMu.Lock()
+	if oldest.upstream != nil {
+		_ = oldest.upstream.Close()
+	}
+	oldest.upstreamMu.Unlock()
+	if oldest.secure != nil {
+		oldest.secure.Close()
+	}
+	delete(s.sessions, oldest.sessionID)
+	log.Printf("[Server] Session %d evicted (max sessions reached)", oldest.sessionID)
 }
 
 // cleanupSessionsLoop purges idle sessions after 60s and cleans up pendingProxyAddrs memory leaks.
@@ -783,11 +1058,22 @@ func (s *Server) cleanupSessionsLoop() {
 						delete(s.pendingProxyAddrs, rawKey)
 						s.proxyAddrMu.Unlock()
 					}
+					if sess.secure != nil {
+						sess.secure.Close()
+					}
 					delete(s.sessions, sid)
 					log.Printf("[Server] Session %d expired and cleaned up", sid)
 				}
 			}
 			s.sessionMu.Unlock()
+
+			s.handshakeMu.Lock()
+			for key, entry := range s.handshakes {
+				if entry == nil || entry.client == nil || now.Sub(entry.created) > 2*time.Minute || !s.sessionPresent(entry.client) {
+					delete(s.handshakes, key)
+				}
+			}
+			s.handshakeMu.Unlock()
 		}
 	}
 }
@@ -813,9 +1099,21 @@ func (s *Server) Stop() {
 			_ = sess.upstream.Close()
 		}
 		sess.upstreamMu.Unlock()
+		if sess.secure != nil {
+			sess.secure.Close()
+		}
 	}
 	s.sessionMu.Unlock()
 
 	s.wg.Wait()
+
+	s.handshakeMu.Lock()
+	for key := range s.handshakes {
+		delete(s.handshakes, key)
+	}
+	s.handshakeMu.Unlock()
+	for i := range s.authKey {
+		s.authKey[i] = 0
+	}
 	log.Printf("[Server] Server stopped successfully")
 }
