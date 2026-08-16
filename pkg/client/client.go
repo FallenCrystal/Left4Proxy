@@ -45,12 +45,15 @@ type serverCandidate struct {
 	addrStr       string
 	udpAddr       *net.UDPAddr
 	conn          *net.UDPConn
+	traffic       *trafficCounters
 	sendTo        *net.UDPAddr // Non-nil only for the punch candidate: an unconnected socket that must use WriteToUDP.
 	isPunch       bool         // Punch (STUN hole-punched) candidate.
 	pubEndpoint   string       // Punch candidate's own public endpoint (C_direct), learned via STUN reflection.
 	lastActive    time.Time
 	lastHandshake time.Time // Last handshake attempt to an offline candidate (reconnect backoff).
 	rtt           time.Duration
+	pingSent      uint64
+	pingReceived  uint64
 	isLAN         bool
 	online        bool
 	lastReflected string // Last STUN-reflected public endpoint, for deduped logging.
@@ -73,12 +76,43 @@ func (cand *serverCandidate) send(data []byte) error {
 	if conn == nil {
 		return fmt.Errorf("candidate connection is nil")
 	}
+	var n int
+	var err error
 	if sendTo != nil {
-		_, err := conn.WriteToUDP(data, sendTo)
-		return err
+		n, err = conn.WriteToUDP(data, sendTo)
+	} else {
+		n, err = conn.Write(data)
 	}
-	_, err := conn.Write(data)
+	if n > 0 && cand.traffic != nil {
+		cand.traffic.l4pUploadBytes.Add(uint64(n))
+	}
 	return err
+}
+
+func (cand *serverCandidate) recordWireReceive(n int) {
+	if cand != nil && n > 0 && cand.traffic != nil {
+		cand.traffic.l4pDownloadBytes.Add(uint64(n))
+	}
+}
+
+// trafficCounters are process-local monotonic counters. Atomic counters keep
+// the data plane independent from the CLI renderer and make a one-second rate
+// sample cheap even while multiple candidate sockets are active.
+type trafficCounters struct {
+	gameUploadBytes   atomic.Uint64
+	gameDownloadBytes atomic.Uint64
+	l4pUploadBytes    atomic.Uint64
+	l4pDownloadBytes  atomic.Uint64
+}
+
+// TrafficSnapshot is a point-in-time view of the four traffic directions
+// exposed by the ping graph. L4P values are wire bytes, including protocol and
+// encryption overhead and traffic sent on alternative candidates.
+type TrafficSnapshot struct {
+	GameUploadBytes   uint64 `json:"game_upload_bytes"`
+	GameDownloadBytes uint64 `json:"game_download_bytes"`
+	L4PUploadBytes    uint64 `json:"l4p_upload_bytes"`
+	L4PDownloadBytes  uint64 `json:"l4p_download_bytes"`
 }
 
 // Client is the Left4Proxy client daemon.
@@ -95,6 +129,7 @@ type Client struct {
 	authKey          []byte
 	mode             atomic.Value // stores the normalized route mode for race-free runtime switches.
 	localConn        *net.UDPConn
+	traffic          trafficCounters
 	candidates       []*serverCandidate
 	bestCandidate    *serverCandidate
 	prevCandidate    *serverCandidate // Previous candidate for temporary dual-sending during route transition.
@@ -406,6 +441,7 @@ func (s *Client) addCandidate(addrStr, path string) (*serverCandidate, bool) {
 		addrStr: addrStr,
 		udpAddr: udpAddr,
 		conn:    conn,
+		traffic: &s.traffic,
 		online:  false,
 		rtt:     999 * time.Millisecond,
 		isLAN:   isLAN,
@@ -515,6 +551,7 @@ func (s *Client) addPunchCandidate(serverPublic *net.UDPAddr) {
 		addrStr:       serverPublic.String(),
 		udpAddr:       serverPublic,
 		conn:          conn,
+		traffic:       &s.traffic,
 		sendTo:        serverPublic,
 		isPunch:       true,
 		rtt:           999 * time.Millisecond,
@@ -662,6 +699,27 @@ func (s *Client) sealClientPacket(cmd byte, payload []byte) ([]byte, error) {
 	return sess.Seal(pkt, security.ClientToServer)
 }
 
+// sendCandidatePing sends one authenticated RTT probe and records it only
+// after the candidate socket accepts the complete UDP datagram. The counters
+// are used for the CLI quality view; route selection keeps its existing
+// hysteresis behavior independent from presentation sampling.
+func (s *Client) sendCandidatePing(cand *serverCandidate) bool {
+	if s == nil || cand == nil {
+		return false
+	}
+	data, err := s.sealClientPacket(protocol.CmdPing, []byte("PING"))
+	if err != nil {
+		return false
+	}
+	if err := cand.send(data); err != nil {
+		return false
+	}
+	cand.mu.Lock()
+	cand.pingSent++
+	cand.mu.Unlock()
+	return true
+}
+
 func (s *Client) sendSecureProbeBurst(cand *serverCandidate, count int, interval time.Duration) {
 	if cand == nil || count <= 0 {
 		return
@@ -673,14 +731,12 @@ func (s *Client) sendSecureProbeBurst(cand *serverCandidate, count int, interval
 		data, err := s.sealClientPacket(protocol.CmdStunProbe, []byte("PUNCH"))
 		if err == nil {
 			cand.mu.RLock()
-			conn, target, retired := cand.conn, cand.sendTo, cand.retired
+			retired := cand.retired
 			cand.mu.RUnlock()
 			if retired {
 				return
 			}
-			if conn != nil && target != nil {
-				_, _ = conn.WriteToUDP(data, target)
-			}
+			_ = cand.send(data)
 		}
 		if i+1 < count && interval > 0 {
 			time.Sleep(interval)
@@ -971,9 +1027,7 @@ func (s *Client) sendHandshake(cand *serverCandidate) {
 	// merely because one candidate went quiet would also replace the server's
 	// upstream UDP socket and drop an active game.
 	if sess := s.secureSession.Load(); sess != nil && !sess.IsClosed() {
-		if data, err := s.sealClientPacket(protocol.CmdPing, []byte("PING")); err == nil {
-			_ = cand.send(data)
-		}
+		s.sendCandidatePing(cand)
 		return
 	}
 	s.handshakeMu.Lock()
@@ -1228,6 +1282,7 @@ func (s *Client) localReadLoop() {
 		if !protocol.IsL4D2Packet(payload) {
 			continue
 		}
+		s.traffic.gameUploadBytes.Add(uint64(n))
 
 		// The game's server browser queries (A2S) come from a separate UDP
 		// socket than the netchannel. Remember it so the query's response is
@@ -1341,6 +1396,7 @@ func (s *Client) candidateReadLoop(cand *serverCandidate) {
 		}
 
 		data := buf[:n]
+		cand.recordWireReceive(n)
 
 		// STUN responses are accepted only through the punch socket's pending
 		// transaction validator.  A forged magic-cookie packet is discarded.
@@ -1482,10 +1538,21 @@ func (s *Client) handleHandshakeResponse(cand *serverCandidate, pkt *protocol.Pa
 		}
 	}
 	// Bind this candidate source to the shared session and obtain a fresh RTT.
-	if data, pingErr := s.sealClientPacket(protocol.CmdPing, []byte("PING")); pingErr == nil {
-		_ = cand.send(data)
-	}
+	s.sendCandidatePing(cand)
 	s.selectBestCandidate()
+}
+
+// writeGamePacket is the single game-facing write path. Counting after the
+// socket write means the graph reports bytes actually handed to the game UDP
+// socket rather than merely bytes received from the remote server.
+func (s *Client) writeGamePacket(payload []byte, addr *net.UDPAddr) {
+	if s == nil || s.localConn == nil || addr == nil || len(payload) == 0 {
+		return
+	}
+	n, _ := s.localConn.WriteToUDP(payload, addr)
+	if n > 0 {
+		s.traffic.gameDownloadBytes.Add(uint64(n))
+	}
 }
 
 // handleServerPacket handles all incoming server packets from a candidate socket.
@@ -1526,11 +1593,12 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		if string(pkt.Payload) != "PONG" {
 			return
 		}
-		cand.mu.RLock()
+		cand.mu.Lock()
+		cand.pingReceived++
 		candRTT := cand.rtt
 		path := cand.pathClass
 		punchEndpoint := cand.punchEndpoint
-		cand.mu.RUnlock()
+		cand.mu.Unlock()
 
 		s.router.UpdateMetrics(s.pathForCandidate(cand), candRTT, 0.0)
 		if punchEndpoint != "" && path == candidatePathRelay {
@@ -1596,12 +1664,12 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		// spurious 0x41 challenge and abort with "Invalid challenge packet".
 		if isA2SResponse(pkt.Payload) {
 			if a2s := s.a2sQueryAddr.Load(); a2s != nil {
-				_, _ = s.localConn.WriteToUDP(pkt.Payload, a2s)
+				s.writeGamePacket(pkt.Payload, a2s)
 				break
 			}
 		}
 		if addr := s.lastClientAddr.Load(); addr != nil {
-			_, _ = s.localConn.WriteToUDP(pkt.Payload, addr)
+			s.writeGamePacket(pkt.Payload, addr)
 		}
 	}
 }
@@ -1663,9 +1731,7 @@ func (s *Client) pingProbeLoop() {
 					// Each path gets a distinct sequence/nonce. Reusing one
 					// ciphertext across candidates would make the replay window
 					// discard the second copy before it can measure that path.
-					if marshaledPing, pingErr := s.sealClientPacket(protocol.CmdPing, []byte("PING")); pingErr == nil {
-						_ = cand.send(marshaledPing)
-					}
+					s.sendCandidatePing(cand)
 				} else {
 					cand.mu.RLock()
 					wasOnline := cand.online
@@ -1846,6 +1912,7 @@ type CandidateStatus struct {
 	ResolvedIP    string          `json:"resolved_ip"`
 	Online        bool            `json:"online"`
 	RTT           time.Duration   `json:"rtt"`
+	LossRate      float64         `json:"loss_rate"`
 	PathType      router.PathType `json:"path_type"`
 	IsLAN         bool            `json:"is_lan"`
 	IsPunch       bool            `json:"is_punch"`
@@ -1863,6 +1930,7 @@ type ClientStatus struct {
 	ActivePath      router.PathType      `json:"active_path"`
 	ActiveCandidate string               `json:"active_candidate"`
 	ActiveRTT       time.Duration        `json:"active_rtt"`
+	ActiveLossRate  float64              `json:"active_loss_rate"`
 	GameConnected   bool                 `json:"game_connected"`
 	GameAddr        string               `json:"game_addr,omitempty"`
 	GameLastSeen    time.Time            `json:"game_last_seen,omitempty"`
@@ -1870,6 +1938,28 @@ type ClientStatus struct {
 	NATSummary      string               `json:"nat_summary"`
 	NATInfo         *stun.NATMappingInfo `json:"nat_info,omitempty"`
 	Candidates      []CandidateStatus    `json:"candidates"`
+}
+
+func pingLossRate(sent, received uint64) float64 {
+	if sent == 0 || received >= sent {
+		return 0
+	}
+	return float64(sent-received) / float64(sent)
+}
+
+// Traffic returns monotonic byte totals used to derive one-second rates in the
+// CLI. It is intentionally a snapshot instead of a rate so callers can choose
+// their own sampling interval without coupling the data plane to a renderer.
+func (s *Client) Traffic() TrafficSnapshot {
+	if s == nil {
+		return TrafficSnapshot{}
+	}
+	return TrafficSnapshot{
+		GameUploadBytes:   s.traffic.gameUploadBytes.Load(),
+		GameDownloadBytes: s.traffic.gameDownloadBytes.Load(),
+		L4PUploadBytes:    s.traffic.l4pUploadBytes.Load(),
+		L4PDownloadBytes:  s.traffic.l4pDownloadBytes.Load(),
+	}
 }
 
 // Status returns a point-in-time snapshot of the client state.
@@ -1890,12 +1980,14 @@ func (s *Client) Status() ClientStatus {
 	activeCandStr := ""
 	activePath := router.PathNone
 	var activeRTT time.Duration
+	var activeLossRate float64
 	activeOnline := false
 	if activeCand != nil {
 		activeCandStr = activeCand.addrStr
 		activeCand.mu.RLock()
 		activeOnline = activeCand.online && s.candidateAllowedValues(activeCand.isLAN, activeCand.pathClass, activeCand.isPunch)
 		activeRTT = activeCand.rtt
+		activeLossRate = pingLossRate(activeCand.pingSent, activeCand.pingReceived)
 		activePath = pathForCandidateValues(activeCand.isLAN, activeCand.pathClass, activeCand.isPunch)
 		if activeCand.udpAddr != nil && activeCand.addrStr != activeCand.udpAddr.String() {
 			activeCandStr = fmt.Sprintf("%s (%s)", activeCand.addrStr, activeCand.udpAddr.String())
@@ -1906,6 +1998,7 @@ func (s *Client) Status() ClientStatus {
 		activeCandStr = ""
 		activePath = router.PathNone
 		activeRTT = 0
+		activeLossRate = 0
 	}
 
 	gameAddr := s.gameConnAddr.Load()
@@ -1939,6 +2032,7 @@ func (s *Client) Status() ClientStatus {
 			ResolvedIP:    resolvedIP,
 			Online:        c.online,
 			RTT:           c.rtt,
+			LossRate:      pingLossRate(c.pingSent, c.pingReceived),
 			PathType:      pathForCandidateValues(c.isLAN, c.pathClass, c.isPunch),
 			IsLAN:         c.isLAN,
 			IsPunch:       c.isPunch,
@@ -1957,6 +2051,7 @@ func (s *Client) Status() ClientStatus {
 		ActivePath:      activePath,
 		ActiveCandidate: activeCandStr,
 		ActiveRTT:       activeRTT,
+		ActiveLossRate:  activeLossRate,
 		GameConnected:   gameConnected,
 		GameAddr:        gameAddrStr,
 		GameLastSeen:    gameLastSeen,
@@ -1986,7 +2081,7 @@ func (s *Client) FormatStatus() string {
 		if st.ActiveRTT > 0 && st.ActiveRTT < 900*time.Millisecond {
 			rttStr = fmt.Sprintf("%.1fms", float64(st.ActiveRTT)/float64(time.Millisecond))
 		}
-		fmt.Fprintf(&b, "  Active Route     : [%s] -> %s (RTT: %s)\n", st.ActivePath, st.ActiveCandidate, rttStr)
+		fmt.Fprintf(&b, "  Active Route     : [%s] -> %s (RTT: %s, Loss: %.1f%%)\n", st.ActivePath, st.ActiveCandidate, rttStr, st.ActiveLossRate*100)
 	} else {
 		b.WriteString("  Active Route     : None (All candidates offline / Handshaking)\n")
 	}
@@ -2036,8 +2131,8 @@ func (s *Client) FormatStatus() string {
 		}
 
 		fmt.Fprintf(&b, "%s[%d] %-8s %s\n", marker, i+1, fmt.Sprintf("[%s]", c.PathType), addrDisplay)
-		fmt.Fprintf(&b, "      Status: %-7s | RTT: %-7s | LAN: %-5v | Last Seen: %s\n",
-			statusStr, rttStr, c.IsLAN, lastSeenStr)
+		fmt.Fprintf(&b, "      Status: %-7s | RTT: %-7s | Loss: %-6.1f%% | LAN: %-5v | Last Seen: %s\n",
+			statusStr, rttStr, c.LossRate*100, c.IsLAN, lastSeenStr)
 
 		if c.PubEndpoint != "" {
 			fmt.Fprintf(&b, "      Local NAT Mapped : %s\n", c.PubEndpoint)
@@ -2109,8 +2204,10 @@ func (s *Client) DetectNAT() *stun.NATMappingInfo {
 	return info
 }
 
-// Probe actively sends ping probe packets to all candidates and refreshes route state and NAT type.
-func (s *Client) Probe() {
+// probeCandidates sends an immediate RTT probe without doing the slower NAT
+// detection. The ping graph calls this once per second so its samples remain
+// independent from the configured background interval.
+func (s *Client) probeCandidates() {
 	s.candidateMu.RLock()
 	cands := make([]*serverCandidate, len(s.candidates))
 	copy(cands, s.candidates)
@@ -2121,9 +2218,7 @@ func (s *Client) Probe() {
 			continue
 		}
 		if s.candidateAllowed(cand) {
-			if marshaledPing, pingErr := s.sealClientPacket(protocol.CmdPing, []byte("PING")); pingErr == nil {
-				_ = cand.send(marshaledPing)
-			}
+			s.sendCandidatePing(cand)
 		}
 		cand.mu.RLock()
 		isPunch := cand.isPunch
@@ -2135,7 +2230,27 @@ func (s *Client) Probe() {
 		}
 	}
 
-	// Trigger async NAT re-detection if unknown
+	s.selectBestCandidate()
+}
+
+// ProbeCandidates sends immediate authenticated probes to all eligible
+// candidates. It is intentionally lightweight for the live ping view.
+func (s *Client) ProbeCandidates() {
+	if s == nil {
+		return
+	}
+	s.probeCandidates()
+}
+
+// Probe actively sends ping probe packets to all candidates and refreshes
+// route state and NAT type.
+func (s *Client) Probe() {
+	if s == nil {
+		return
+	}
+	s.probeCandidates()
+
+	// Trigger async NAT re-detection if unknown.
 	if s.routeMode() != "relay-only" && s.natInfo.Load() == nil {
 		s.scheduleNATDetection()
 	}

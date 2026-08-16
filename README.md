@@ -277,7 +277,8 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o b
 | 命令 | 别名 | 功能说明 |
 | :--- | :--- | :--- |
 | `status` | `st`, `s`, `info` | 打印当前连接会话, 本地监听, 活跃路由模式, 本地 NAT 映射类型, 游戏连接状态及所有候选节点延迟与 NAT 信息 |
-| `ping` | `probe`, `p`, `refresh` | 主动向所有候选节点发送探测包并即时刷新最优路由与 NAT 检测 |
+| `ping` | | 进入每秒刷新的 Braille 点阵延迟/网络质量图表，显示当前路由、RTT、探测丢包率、游戏连接状态，以及游戏与 L4P 实际上下行速率；再次输入 `ping` 或 `ping stop` 退出 |
+| `probe` | `p`, `refresh` | 主动向所有候选节点发送一次探测包并即时刷新最优路由与 NAT 检测 |
 | `nat` | | 主动向多台公网 STUN 服务器发起并发探测, 展示详细的 NAT 映射行为与端口增量步长 |
 | `mode [模式]` | `m` | 查看当前路由模式或动态切换 (支持 `auto`, `direct-only`, `relay-only`)  |
 | `candidates` | `list`, `ls` | 简要列出当前所有服务端候选节点 |

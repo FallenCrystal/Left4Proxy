@@ -11,11 +11,14 @@ import (
 
 	"left4proxy/pkg/client"
 	"left4proxy/pkg/config"
+	"left4proxy/pkg/termui"
 )
 
 const Version = "1.0.0"
 
 func main() {
+	log.SetOutput(termui.NewColorLogWriter(os.Stderr))
+
 	var (
 		configFile  string
 		serverAddr  string
