@@ -2,12 +2,8 @@
 
 > 说明: 本项目及其相关代码与(部分)文档由人工智能 (AI) 辅助设计与生成.  
 > 虽经过一定的测试和代码审查, 但仍可能含有未发现的问题. 请谨慎使用.
-> 
-> 工具:  
-> Antigravity + Gemini 3.6 Flash (High) : 基础应用程序架构  
-> Claude Code + DeepSeek V4 Flash (High, 0731) : 关键代码审查, STUN 打洞, 错误修复等.  
-> Antigravity + Gemini 3.7 Flash (High) : 打洞优化  
-> Codex + GPT 5.6 Sol (Max) : 测试覆盖, 加密, 清理代码等.
+
+[查看该项目正在使用的 AI 编码工具和模型](#使用的工具和-ai-模型)
 
 Left4Proxy 是一套专为求生之路 2 (Left 4 Dead 2 / Source 引擎) 设计的专用网络代理与动态选路中间件.
 
@@ -277,7 +273,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o b
 | 命令 | 别名 | 功能说明 |
 | :--- | :--- | :--- |
 | `status` | `st`, `s`, `info` | 打印当前连接会话, 本地监听, 活跃路由模式, 本地 NAT 映射类型, 游戏连接状态及所有候选节点延迟与 NAT 信息 |
-| `ping` | | 进入每秒刷新的 Braille 点阵延迟/网络质量图表，显示当前路由、RTT、探测丢包率、游戏连接状态，以及游戏与 L4P 实际上下行速率；再次输入 `ping` 或 `ping stop` 退出 |
+| `ping` | | 进入每秒刷新的 Braille 点阵延迟/网络质量图表, 显示当前路由, RTT, 探测丢包率, 游戏连接状态. 以及游戏与 L4P 实际上下行速率; 再次输入 `ping` 或 `ping stop` 退出 |
 | `probe` | `p`, `refresh` | 主动向所有候选节点发送一次探测包并即时刷新最优路由与 NAT 检测 |
 | `nat` | | 主动向多台公网 STUN 服务器发起并发探测, 展示详细的 NAT 映射行为与端口增量步长 |
 | `mode [模式]` | `m` | 查看当前路由模式或动态切换 (支持 `auto`, `direct-only`, `relay-only`)  |
@@ -286,6 +282,16 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o b
 | `help` | `h`, `?` | 显示可用交互命令帮助菜单 |
 | `quit` | `exit`, `q` | 优雅停止所有协程并退出客户端 |
 
+## 使用的工具和 AI 模型
+
+- Antigravity
+  - Gemini 3.6 Flash (High) : 基础应用程序架构
+  - Gemini 3.7 Flash (High) : 打洞优化
+- Codex
+  - GPT 5.6 Sol (Max) : 测试覆盖, 加密, 代码清理
+  - GPT 5.6 Luna (Max) : CLI着色, Ping图标
+- Claude Code
+  - DeepSeek V4 Flash (High, 0731) : 关键代码审查, STUN 打洞, 错误修复等.  
 
 ## 许可证
 
