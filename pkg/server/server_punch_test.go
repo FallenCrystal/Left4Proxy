@@ -203,19 +203,31 @@ func TestServerPongEchoesAuthenticatedPingTimestamp(t *testing.T) {
 
 	buf := make([]byte, 2048)
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, _, err := conn.ReadFromUDP(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pong, err := session.Open(buf[:n], security.ServerToClient)
-	if err != nil {
-		t.Fatalf("authenticate pong: %v", err)
-	}
-	if pong.Cmd != protocol.CmdPong {
-		t.Fatalf("command = %d, want CmdPong", pong.Cmd)
+	var pong, hint *protocol.Packet
+	for pong == nil || hint == nil {
+		n, _, readErr := conn.ReadFromUDP(buf)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		candidate, openErr := session.Open(buf[:n], security.ServerToClient)
+		if openErr != nil {
+			t.Fatalf("authenticate ping response: %v", openErr)
+		}
+		switch candidate.Cmd {
+		case protocol.CmdPong:
+			pong = candidate
+		case protocol.CmdPathHint:
+			hint = candidate
+		}
 	}
 	if pong.Timestamp != wantTimestamp {
 		t.Fatalf("pong timestamp = %d, want echoed %d", pong.Timestamp, wantTimestamp)
+	}
+	if string(pong.Payload) != "PONG" {
+		t.Fatalf("pong payload = %q, want PONG", pong.Payload)
+	}
+	if path, ok := protocol.DecodePathHint(hint.Payload); !ok || path != protocol.PathHintDirect {
+		t.Fatalf("path hint = %q, ok=%v; want direct", hint.Payload, ok)
 	}
 }
 
@@ -274,19 +286,28 @@ func TestAuthenticatedPingBindsCandidateWithoutChangingSession(t *testing.T) {
 
 	buf := make([]byte, 4096)
 	_ = connB.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var pong *protocol.Packet
-	for pong == nil {
+	var pong, hint *protocol.Packet
+	for pong == nil || hint == nil {
 		n, _, rerr := connB.ReadFromUDP(buf)
 		if rerr != nil {
 			t.Fatal(rerr)
 		}
 		candidate, oerr := session.Open(buf[:n], security.ServerToClient)
-		if oerr == nil && candidate.Cmd == protocol.CmdPong {
+		if oerr != nil {
+			t.Fatal(oerr)
+		}
+		switch candidate.Cmd {
+		case protocol.CmdPong:
 			pong = candidate
+		case protocol.CmdPathHint:
+			hint = candidate
 		}
 	}
 	if string(pong.Payload) != "PONG" {
-		t.Fatalf("unexpected pong payload: %q", pong.Payload)
+		t.Fatalf("pong payload = %q, want PONG", pong.Payload)
+	}
+	if path, ok := protocol.DecodePathHint(hint.Payload); !ok || path != protocol.PathHintDirect {
+		t.Fatalf("unexpected path hint: %q (ok=%v)", hint.Payload, ok)
 	}
 
 	dataPayload := []byte{0xff, 0xff, 0xff, 0xff, 'T', 'E', 'S', 'T'}

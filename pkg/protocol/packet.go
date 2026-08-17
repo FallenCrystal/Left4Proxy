@@ -32,6 +32,16 @@ const (
 	CmdPunchOffer    byte = 0x0A // server→client: server's public punch endpoint (ip:port)
 	CmdPunchInit     byte = 0x0B // client→server (over relay): client's direct-socket public endpoint
 	CmdPunchAck      byte = 0x0C // server→client: PunchInit acknowledged
+	CmdPathHint      byte = 0x0D // server→client: authenticated Relay/Direct classification for one candidate
+
+	// Authenticated path hints are sent in CmdPathHint packets. They remain
+	// separate from CmdPong so older clients that require the literal "PONG"
+	// payload retain their heartbeat behavior.
+	PathHintLAN    = "lan"
+	PathHintRelay  = "relay"
+	PathHintPunch  = "punch"
+	PathHintDirect = "direct"
+	pathHintPrefix = "L4PATH:"
 
 	HeaderSize = 28 // 4 + 1 + 1 + 8 + 4 + 8 + 2
 
@@ -41,6 +51,33 @@ const (
 	MaxUDPPayloadSize    = 65507
 	MaxPacketPayloadSize = MaxUDPPayloadSize - HeaderSize
 )
+
+// EncodePathHint creates the payload used by an authenticated path hint.
+// An empty result means path is not one of the protocol's known classes.
+func EncodePathHint(path string) []byte {
+	switch path {
+	case PathHintLAN, PathHintRelay, PathHintPunch, PathHintDirect:
+		return []byte(pathHintPrefix + path)
+	default:
+		return nil
+	}
+}
+
+// DecodePathHint validates and extracts a server path classification from an
+// authenticated CmdPathHint payload.
+func DecodePathHint(payload []byte) (string, bool) {
+	const prefixLen = len(pathHintPrefix)
+	if len(payload) <= prefixLen || string(payload[:prefixLen]) != pathHintPrefix {
+		return "", false
+	}
+	path := string(payload[prefixLen:])
+	switch path {
+	case PathHintLAN, PathHintRelay, PathHintPunch, PathHintDirect:
+		return path, true
+	default:
+		return "", false
+	}
+}
 
 var (
 	ErrInvalidMagic   = errors.New("invalid protocol magic header")

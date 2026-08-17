@@ -107,3 +107,21 @@ func TestUnmarshalRejectsDatagramsThatExceedUDPSize(t *testing.T) {
 		t.Fatal("oversized UDP payload was classified as an L4D2 packet")
 	}
 }
+
+func TestPathHintEncoding(t *testing.T) {
+	for _, want := range []string{PathHintLAN, PathHintRelay, PathHintPunch, PathHintDirect} {
+		payload := EncodePathHint(want)
+		if len(payload) == 0 {
+			t.Fatalf("failed to encode %q", want)
+		}
+		if got, ok := DecodePathHint(payload); !ok || got != want {
+			t.Fatalf("decoded hint = %q, ok=%v; want %q", got, ok, want)
+		}
+	}
+	if EncodePathHint("unknown") != nil {
+		t.Fatal("unknown path hint was encoded")
+	}
+	if _, ok := DecodePathHint([]byte("L4PATH:relay\x00")); ok {
+		t.Fatal("malformed path hint was accepted")
+	}
+}

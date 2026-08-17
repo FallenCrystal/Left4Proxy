@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"left4proxy/pkg/config"
+	"left4proxy/pkg/protocol"
+	"left4proxy/pkg/proxyproto"
 	"left4proxy/pkg/router"
 	"left4proxy/pkg/server"
 	"left4proxy/pkg/stun"
@@ -121,24 +123,47 @@ func TestPathForCandidate(t *testing.T) {
 	}
 }
 
-func TestAdvertisedAddressPromotesConfiguredEntry(t *testing.T) {
-	c := &Client{}
+func TestAdvertisedAddressDoesNotChoosePath(t *testing.T) {
+	c := &Client{cfg: config.DefaultClientConfig()}
 	local := mkCand("127.0.0.1:27014", 0, false, true)
 	local.pathClass = candidatePathRelay
-	c.setCandidatePath(local, candidatePathDirect)
-	if local.pathClass != candidatePathLAN {
-		t.Fatalf("advertised local entry path = %q, want LAN", local.pathClass)
+	c.setCandidatePath(local, "")
+	if local.pathClass != candidatePathRelay {
+		t.Fatalf("advertised local entry changed provisional path to %q", local.pathClass)
 	}
 
 	public := mkCand("198.51.100.20:27014", 0, false, false)
-	public.pathClass = candidatePathRelay
-	c.setCandidatePath(public, candidatePathDirect)
-	if public.pathClass != candidatePathDirect {
-		t.Fatalf("advertised public entry path = %q, want Direct", public.pathClass)
+	c.setCandidatePath(public, "")
+	if public.pathClass != "" {
+		t.Fatalf("advertised public entry path = %q, want unknown", public.pathClass)
 	}
-	c.setCandidatePath(public, candidatePathRelay)
-	if public.pathClass != candidatePathDirect {
-		t.Fatal("configured relay role downgraded authenticated direct provenance")
+	if !c.applyPathHint(public, protocol.PathHintDirect) || public.pathClass != candidatePathDirect {
+		t.Fatalf("authenticated direct hint did not classify candidate: %q", public.pathClass)
+	}
+	if !c.applyPathHint(public, protocol.PathHintRelay) || public.pathClass != candidatePathRelay {
+		t.Fatalf("authenticated relay hint did not override advertised address: %q", public.pathClass)
+	}
+	if !c.applyPathHint(public, protocol.PathHintDirect) || public.pathClass != candidatePathDirect {
+		t.Fatalf("authenticated direct hint did not restore candidate: %q", public.pathClass)
+	}
+
+	// A loopback/private candidate may be shown as LAN only after the server
+	// authenticated that this specific connection was non-proxied.
+	if !c.applyPathHint(local, protocol.PathHintDirect) || local.pathClass != candidatePathLAN {
+		t.Fatalf("non-proxied local hint path = %q, want LAN", local.pathClass)
+	}
+	if !c.applyPathHint(local, protocol.PathHintRelay) || local.pathClass != candidatePathRelay {
+		t.Fatalf("proxied local hint path = %q, want Relay", local.pathClass)
+	}
+
+	// The production path-hint handler consumes the same authenticated format.
+	c.router = router.NewRouter("auto")
+	if !local.online {
+		local.online = true
+	}
+	c.handleServerPacket(local, &protocol.Packet{Cmd: protocol.CmdPathHint, Payload: protocol.EncodePathHint(protocol.PathHintRelay)})
+	if local.pathClass != candidatePathRelay {
+		t.Fatalf("path hint relay path = %q, want Relay", local.pathClass)
 	}
 }
 
@@ -248,17 +273,17 @@ func TestClientModeRouting(t *testing.T) {
 	}
 }
 
-func TestRelayOnlyUsesCandidateProvenance(t *testing.T) {
+func TestRelayOnlyUsesAuthenticatedPathClass(t *testing.T) {
 	cfg := config.DefaultClientConfig()
 	cfg.Mode = "relay-only"
 	c := &Client{cfg: cfg}
 
-	// A configured relay endpoint may resolve to loopback/private space. Its
-	// configured provenance still takes priority over address shape.
+	// A PROXY-classified endpoint may resolve to loopback/private space. Its
+	// authenticated Relay classification still takes priority over address shape.
 	localRelay := mkCand("127.0.0.1:27014", 5*time.Millisecond, true, true)
 	localRelay.pathClass = candidatePathRelay
 	if !c.candidateAllowed(localRelay) {
-		t.Fatal("relay-only rejected a configured relay on a local address")
+		t.Fatal("relay-only rejected a proxied candidate on a local address")
 	}
 
 	localRelay.pathClass = candidatePathDirect
@@ -271,12 +296,12 @@ func TestRelayOnlyUsesCandidateProvenance(t *testing.T) {
 	}
 }
 
-func TestConfiguredRelayDoesNotReceiveLANPreference(t *testing.T) {
+func TestProxiedLoopbackCandidateDoesNotReceiveLANPreference(t *testing.T) {
 	cfg := config.DefaultClientConfig()
 	c := &Client{cfg: cfg}
 
-	// Local tunnel processes commonly expose the relay on loopback. Its
-	// configured Relay classification must override the address-based LAN
+	// Local tunnel processes commonly expose a proxied candidate on loopback.
+	// Its authenticated Relay classification must override the address-based LAN
 	// hint, otherwise the 10x LAN preference prevents a faster punched path
 	// from ever being selected.
 	localRelay := mkCand("127.0.0.1:27014", 50*time.Millisecond, true, true)
@@ -289,7 +314,7 @@ func TestConfiguredRelayDoesNotReceiveLANPreference(t *testing.T) {
 	c.bestCandidate = localRelay
 	c.selectBestCandidate()
 	if c.bestCandidate != punch {
-		t.Fatalf("configured loopback relay retained LAN preference; selected %v", c.bestCandidate)
+		t.Fatalf("proxied loopback candidate retained LAN preference; selected %v", c.bestCandidate)
 	}
 }
 
@@ -334,6 +359,9 @@ func TestClientServerIntegration(t *testing.T) {
 	defer cli.Stop()
 
 	time.Sleep(500 * time.Millisecond)
+	if got := cli.Status().ActivePath; got != router.PathLAN {
+		t.Fatalf("headerless local candidate path = %q, want LAN after authenticated Pong", got)
+	}
 
 	// 4. Send Source Engine A2S_INFO query UDP packet from mock game client to 127.0.0.2:27015
 	mockGameConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 27015})
@@ -360,6 +388,117 @@ func TestClientServerIntegration(t *testing.T) {
 		t.Fatalf("expected packet size >= %d, got %d", len(a2sQuery), n)
 	}
 	t.Logf("Successfully proxied L4D2 packet through Left4Proxy! Received %d bytes from %s", n, srcAddr.String())
+}
+
+func TestClientClassifiesProxiedAdvertisedCandidateAsRelay(t *testing.T) {
+	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverReservation, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		_ = relayConn.Close()
+		t.Fatal(err)
+	}
+	serverAddr := cloneUDPAddr(serverReservation.LocalAddr().(*net.UDPAddr))
+	if err := serverReservation.Close(); err != nil {
+		_ = relayConn.Close()
+		t.Fatal(err)
+	}
+
+	key := integrationKey()
+	serverCfg := config.DefaultServerConfig()
+	serverCfg.ListenAddr = serverAddr.String()
+	serverCfg.TargetAddr = "127.0.0.1:27015"
+	serverCfg.PublicIPs = []string{relayConn.LocalAddr().String()}
+	serverCfg.PunchAddr = "127.0.0.1:1"
+	serverCfg.ProxyProtocolV2 = true
+	serverCfg.ProxyTrustedAddrs = []string{"127.0.0.1"}
+	serverCfg.AuthKey = key
+
+	srv, err := server.NewServer(serverCfg)
+	if err != nil {
+		_ = relayConn.Close()
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		_ = relayConn.Close()
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	relayDone := make(chan struct{})
+	var relayWG sync.WaitGroup
+	relayWG.Add(1)
+	go func() {
+		defer relayWG.Done()
+		buf := make([]byte, 65535)
+		var clientAddr *net.UDPAddr
+		firstClientPacket := true
+		for {
+			_ = relayConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, source, readErr := relayConn.ReadFromUDP(buf)
+			if readErr != nil {
+				if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+					select {
+					case <-relayDone:
+						return
+					default:
+						continue
+					}
+				}
+				return
+			}
+			if sameUDPAddr(source, serverAddr) {
+				if clientAddr != nil {
+					_, _ = relayConn.WriteToUDP(buf[:n], clientAddr)
+				}
+				continue
+			}
+
+			clientAddr = cloneUDPAddr(source)
+			payload := append([]byte(nil), buf[:n]...)
+			if firstClientPacket {
+				header, headerErr := proxyproto.BuildV2Header(&net.UDPAddr{IP: net.ParseIP("198.51.100.99"), Port: 42000}, serverAddr)
+				if headerErr != nil {
+					return
+				}
+				payload = append(header, payload...)
+				firstClientPacket = false
+			}
+			_, _ = relayConn.WriteToUDP(payload, serverAddr)
+		}
+	}()
+	defer func() {
+		close(relayDone)
+		_ = relayConn.Close()
+		relayWG.Wait()
+	}()
+
+	clientCfg := config.DefaultClientConfig()
+	clientCfg.ListenAddr = "127.0.0.2:0"
+	clientCfg.ServerAddrs = []string{relayConn.LocalAddr().String()}
+	clientCfg.EnableLAN = true
+	clientCfg.EnablePunch = false
+	clientCfg.PingInterval = 1
+	clientCfg.AuthKey = key
+	cli, err := NewClient(clientCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if status := cli.Status(); status.ActivePath == router.PathRelay {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("proxied candidate path = %q, want Relay; candidates=%#v", cli.Status().ActivePath, cli.Status().Candidates)
 }
 
 func TestClientStatusReporting(t *testing.T) {

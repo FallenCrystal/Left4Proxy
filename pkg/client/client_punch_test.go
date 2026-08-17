@@ -374,8 +374,8 @@ func TestPunchCandidateEstablishment(t *testing.T) {
 }
 
 // TestMaybeCreatePunchCandidateGating verifies when the client decides to start
-// punching: it must be enabled, not relay-only, require an existing relay
-// candidate, and not duplicate an address it already has.
+// punching: it must be enabled, not relay-only, require an authenticated
+// non-punch control candidate, and not duplicate an address it already has.
 func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 	mk := func(mode string) *Client {
 		cfg := config.DefaultClientConfig()
@@ -390,7 +390,7 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 
 	target := "9.9.9.9:27014"
 
-	// 1. No relay candidate -> no punch candidate.
+	// 1. No authenticated control candidate -> no punch candidate.
 	c := mk("auto")
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 0 {
@@ -424,6 +424,25 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 2 || !c.candidates[1].isPunch {
 		t.Fatalf("expected a punch candidate to be created, got %d candidates", len(c.candidates))
+	}
+	c.Stop()
+
+	// 5. A relay promoted to Direct by authenticated metadata still receives
+	// Pongs on its authenticated control socket. That Pong must start punching
+	// rather than being limited to candidates still labelled Relay.
+	c = mk("auto")
+	directAddr, _ := net.ResolveUDPAddr("udp", "1.2.3.4:27014")
+	direct := &serverCandidate{
+		addrStr:       "1.2.3.4:27014",
+		udpAddr:       directAddr,
+		online:        true,
+		pathClass:     candidatePathDirect,
+		punchEndpoint: target,
+	}
+	c.candidates = []*serverCandidate{direct}
+	c.handleServerPacket(direct, &protocol.Packet{Cmd: protocol.CmdPong, Payload: []byte("PONG")})
+	if len(c.candidates) != 2 || !c.candidates[1].isPunch {
+		t.Fatalf("promoted Direct control candidate did not create a punch candidate; got %d candidates", len(c.candidates))
 	}
 	c.Stop()
 }

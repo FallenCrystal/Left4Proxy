@@ -1,5 +1,6 @@
 # Left4Proxy Client Configuration
 
+# 客户端启动时先尝试的服务端地址；不决定 Direct/Relay 分类。
 server_addrs:
     - 127.0.0.1:27014
 listen_addr: 127.0.0.2:27015

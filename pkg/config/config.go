@@ -23,7 +23,7 @@ const DefaultPublicStunServer = "stun.cloudflare.com:3478"
 
 // ClientConfig holds settings for the Left4Proxy client.
 type ClientConfig struct {
-	ServerAddrs  []string `yaml:"server_addrs"`  // Server external IPs/domains
+	ServerAddrs  []string `yaml:"server_addrs"`  // Initial server endpoints to try; path is classified per connection.
 	ListenAddr   string   `yaml:"listen_addr"`   // Local listen address for L4D2 client (default: 127.0.0.2:27015)
 	Mode         string   `yaml:"mode"`          // Mode: auto, direct-only, relay-only
 	AuthKey      []byte   `yaml:"-"`             // Shared key loaded from .secret.
@@ -36,14 +36,16 @@ type ClientConfig struct {
 
 // ServerConfig holds settings for the Left4Proxy server.
 type ServerConfig struct {
-	ListenAddr string   `yaml:"listen_addr"` // Listen address for clients (default: :27014)
-	TargetAddr string   `yaml:"target_addr"` // Upstream L4D2 server address (default: 127.0.0.1:27015)
-	EnableUPnP bool     `yaml:"enable_upnp"` // Enable automatic UPnP port mapping (default: false)
-	AuthKey    []byte   `yaml:"-"`           // Shared key loaded from .secret.
-	SecretPath string   `yaml:"-"`           // Resolved alongside the YAML file.
-	PublicIPs  []string `yaml:"public_ips"`  // Direct server IPs/domains announced to clients.
-	StunServer string   `yaml:"stun_server"` // Public STUN server used to discover the server's own public endpoint (default: stun.cloudflare.com:3478)
-	PunchAddr  string   `yaml:"punch_addr"`  // Manual override for the server's public punch endpoint (ip:port); empty = auto STUN discovery
+	ListenAddr        string   `yaml:"listen_addr"`                  // Listen address for clients (default: :27014)
+	TargetAddr        string   `yaml:"target_addr"`                  // Upstream L4D2 server address (default: 127.0.0.1:27015)
+	ProxyProtocolV2   bool     `yaml:"proxy_protocol_v2"`            // Parse PROXY protocol v1/v2 headers from a trusted UDP relay.
+	ProxyTrustedAddrs []string `yaml:"proxy_protocol_trusted_addrs"` // IP/CIDR sources whose PROXY envelopes are trusted.
+	EnableUPnP        bool     `yaml:"enable_upnp"`                  // Enable automatic UPnP port mapping (default: false)
+	AuthKey           []byte   `yaml:"-"`                            // Shared key loaded from .secret.
+	SecretPath        string   `yaml:"-"`                            // Resolved alongside the YAML file.
+	PublicIPs         []string `yaml:"public_ips"`                   // Server addresses announced to clients; path is classified per connection.
+	StunServer        string   `yaml:"stun_server"`                  // Public STUN server used to discover the server's own public endpoint (default: stun.cloudflare.com:3478)
+	PunchAddr         string   `yaml:"punch_addr"`                   // Manual override for the server's public punch endpoint (ip:port); empty = auto STUN discovery
 }
 
 // DefaultClientConfig returns default client settings.
@@ -62,8 +64,10 @@ func DefaultClientConfig() *ClientConfig {
 // DefaultServerConfig returns default server settings.
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		ListenAddr: ":27014",
-		TargetAddr: "127.0.0.1:27015",
+		ListenAddr:        ":27014",
+		TargetAddr:        "127.0.0.1:27015",
+		ProxyProtocolV2:   false,
+		ProxyTrustedAddrs: []string{"127.0.0.1"},
 		// UPnP changes router state and can expose a UDP port.  Keep it opt-in;
 		// operators who want automatic mapping can enable it explicitly.
 		EnableUPnP: false,
@@ -177,14 +181,16 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	}
 
 	type rawServerConfig struct {
-		ListenAddr   string   `yaml:"listen_addr"`
-		TargetAddr   string   `yaml:"target_addr"`
-		TargetAddrs  string   `yaml:"target_addrs"`
-		EnableUPnP   *bool    `yaml:"enable_upnp"`
-		LegacySecret string   `yaml:"secret"`
-		PublicIPs    []string `yaml:"public_ips"`
-		StunServer   string   `yaml:"stun_server"`
-		PunchAddr    string   `yaml:"punch_addr"`
+		ListenAddr        string   `yaml:"listen_addr"`
+		TargetAddr        string   `yaml:"target_addr"`
+		TargetAddrs       string   `yaml:"target_addrs"`
+		ProxyProtocolV2   bool     `yaml:"proxy_protocol_v2"`
+		ProxyTrustedAddrs []string `yaml:"proxy_protocol_trusted_addrs"`
+		EnableUPnP        *bool    `yaml:"enable_upnp"`
+		LegacySecret      string   `yaml:"secret"`
+		PublicIPs         []string `yaml:"public_ips"`
+		StunServer        string   `yaml:"stun_server"`
+		PunchAddr         string   `yaml:"punch_addr"`
 	}
 	var raw rawServerConfig
 	if err := decodeConfigYAML(data, &raw); err != nil {
@@ -203,6 +209,14 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	}
 	if raw.EnableUPnP != nil {
 		cfg.EnableUPnP = *raw.EnableUPnP
+	}
+	cfg.ProxyProtocolV2 = raw.ProxyProtocolV2
+	if raw.ProxyTrustedAddrs != nil {
+		// Preserve an explicitly empty YAML list so server startup can reject
+		// proxy_protocol_v2 with no trusted header source instead of silently
+		// restoring the default loopback whitelist.
+		cfg.ProxyTrustedAddrs = make([]string, len(raw.ProxyTrustedAddrs))
+		copy(cfg.ProxyTrustedAddrs, raw.ProxyTrustedAddrs)
 	}
 	cfg.PublicIPs = raw.PublicIPs
 	if raw.StunServer != "" {

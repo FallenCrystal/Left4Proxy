@@ -57,7 +57,7 @@ type serverCandidate struct {
 	isLAN         bool
 	online        bool
 	lastReflected string // Last STUN-reflected public endpoint, for deduped logging.
-	pathClass     string // Trusted candidate provenance: "relay" | "direct" | "punch" | "lan".
+	pathClass     string // Authenticated path class: "relay" | "direct" | "punch" | "lan".
 	punchEndpoint string // Authenticated server punch endpoint advertised in the handshake.
 	stunValidator *stun.Validator
 	retired       bool // Set before a failed punch socket is closed and removed.
@@ -318,7 +318,9 @@ func (s *Client) Start() error {
 	// 2. Resolve remote server external addresses/domains
 	addrs := s.cfg.GetServerAddrs()
 	for _, addrStr := range addrs {
-		s.addCandidate(addrStr, candidatePathRelay)
+		// The address source is not a path classification. Wait for this socket's
+		// authenticated Ping/Pong before admitting it to the data route.
+		s.addCandidate(addrStr, "")
 	}
 
 	if len(s.candidates) == 0 {
@@ -379,9 +381,9 @@ func (s *Client) Start() error {
 	return nil
 }
 
-// addCandidate resolves an endpoint and records its trusted provenance. Client
-// configuration supplies relay entry points; the authenticated handshake
-// supplies direct server addresses.
+// addCandidate resolves an endpoint and records only a provisional candidate.
+// Whether the path is actually Relay or Direct is learned from the server's
+// authenticated Ping/Pong exchange; public_ips itself is only an address list.
 func (s *Client) addCandidate(addrStr, path string) (*serverCandidate, bool) {
 	normalized, err := discover.NormalizeEndpoint(addrStr, defaultServerPort)
 	if err != nil {
@@ -472,25 +474,80 @@ func (s *Client) setCandidatePath(cand *serverCandidate, path string) {
 		cand.pathClass = candidatePathPunch
 		return
 	}
-	if path == candidatePathDirect && cand.isLAN {
-		path = candidatePathLAN
-	}
-	switch path {
-	case candidatePathLAN, candidatePathDirect:
-		// An authenticated advertised address is more specific than the relay
-		// role assigned to an initial entry point, so it may promote a duplicate.
-		cand.pathClass = path
-	case candidatePathRelay:
+	// Relay can be retained as a legacy fallback after an old server's plain
+	// Pong. Direct/LAN labels are observations, not candidate-list provenance,
+	// and are applied only by applyPathHint.
+	if path == candidatePathRelay {
 		if cand.pathClass == "" || cand.pathClass == candidatePathRelay {
 			cand.pathClass = path
 		}
 	}
 }
 
+// applyPathHint applies the server's authenticated classification for this
+// exact candidate socket. A relay hint always wins over address-based LAN
+// detection; a non-relay hint may be displayed as LAN when that local
+// optimization is enabled.
+func (s *Client) applyPathHint(cand *serverCandidate, hint string) bool {
+	if cand == nil {
+		return false
+	}
+	if hint != protocol.PathHintRelay && hint != protocol.PathHintDirect && hint != protocol.PathHintLAN && hint != protocol.PathHintPunch {
+		return false
+	}
+	cand.mu.Lock()
+	defer cand.mu.Unlock()
+	if cand.isPunch {
+		cand.pathClass = candidatePathPunch
+		return true
+	}
+	switch hint {
+	case protocol.PathHintRelay:
+		cand.pathClass = candidatePathRelay
+	case protocol.PathHintLAN:
+		if s != nil && s.cfg != nil && s.cfg.EnableLAN && cand.isLAN {
+			cand.pathClass = candidatePathLAN
+		} else {
+			cand.pathClass = candidatePathDirect
+		}
+	case protocol.PathHintDirect:
+		if s != nil && s.cfg != nil && s.cfg.EnableLAN && cand.isLAN {
+			cand.pathClass = candidatePathLAN
+		} else {
+			cand.pathClass = candidatePathDirect
+		}
+	case protocol.PathHintPunch:
+		// A punch socket is identified locally by isPunch. Keep a non-punch
+		// candidate conservative if an older server sends this hint.
+		cand.pathClass = candidatePathDirect
+	}
+	return true
+}
+
+func (s *Client) applyPathHintPayload(cand *serverCandidate, payload []byte) bool {
+	hint, ok := protocol.DecodePathHint(payload)
+	if !ok {
+		return false
+	}
+	cand.mu.RLock()
+	oldPath := cand.pathClass
+	cand.mu.RUnlock()
+	if !s.applyPathHint(cand, hint) {
+		return false
+	}
+	cand.mu.RLock()
+	newPath := cand.pathClass
+	cand.mu.RUnlock()
+	if oldPath != newPath {
+		log.Printf("[Client] Candidate path authenticated -> [%s] (Path: %s, PROXY: %v)", cand.addrStr, newPath, hint == protocol.PathHintRelay)
+	}
+	return true
+}
+
 // maybeCreatePunchCandidate establishes a STUN hole-punched direct candidate
-// toward the server's public endpoint. It is a no-op unless punching is enabled
-// and the server is reachable via a tunnel — that is the case where a direct
-// (non-relay) path is actually valuable.
+// toward the server's public endpoint. It needs one authenticated non-punch
+// control path for PunchInit; that path can be a relay or direct candidate
+// after its authenticated per-socket classification.
 func (s *Client) maybeCreatePunchCandidate(serverPublic string) {
 	if !s.cfg.EnablePunch || s.routeMode() == "relay-only" {
 		return
@@ -511,22 +568,9 @@ func (s *Client) maybeCreatePunchCandidate(serverPublic string) {
 			return // already have this endpoint (e.g. a direct / port-forwarded candidate)
 		}
 	}
-	hasRelay := false
-	for _, c := range s.candidates {
-		if c == nil {
-			continue
-		}
-		c.mu.RLock()
-		hint, online := c.pathClass, c.online
-		c.mu.RUnlock()
-		if hint == candidatePathRelay && online {
-			hasRelay = true
-			break
-		}
-	}
 	s.candidateMu.RUnlock()
 
-	if !hasRelay {
+	if s.punchControlCandidate() == nil {
 		return
 	}
 	s.addPunchCandidate(addr)
@@ -1050,7 +1094,7 @@ func (s *Client) sendHandshake(cand *serverCandidate) {
 	_ = cand.send(data)
 }
 
-// pathForCandidate maps trusted candidate provenance to the routing tier.
+// pathForCandidate maps an authenticated path class to the routing tier.
 func (s *Client) pathForCandidate(cand *serverCandidate) router.PathType {
 	if cand == nil {
 		return router.PathNone
@@ -1530,7 +1574,10 @@ func (s *Client) handleHandshakeResponse(cand *serverCandidate, pkt *protocol.Pa
 		for _, advAddr := range strings.Split(parts[1], ",") {
 			advAddr = strings.TrimSpace(advAddr)
 			if advAddr != "" {
-				newCand, isNew := s.addCandidate(advAddr, candidatePathDirect)
+				// public_ips only declares another address to try. Do not label it
+				// Direct until this socket's authenticated Pong reports that no
+				// PROXY envelope was used.
+				newCand, isNew := s.addCandidate(advAddr, "")
 				if isNew && newCand != nil {
 					s.sendHandshake(newCand)
 				}
@@ -1589,19 +1636,38 @@ func (s *Client) handleServerPacket(cand *serverCandidate, pkt *protocol.Packet)
 		// handleHandshakeResponse before this secure-packet dispatcher.
 		return
 
+	case protocol.CmdPathHint:
+		if !s.applyPathHintPayload(cand, pkt.Payload) {
+			return
+		}
+		s.selectBestCandidate()
+
 	case protocol.CmdPong:
 		if string(pkt.Payload) != "PONG" {
-			return
+			// Accept the short-lived path-in-Pong format during a rolling update,
+			// but current servers send CmdPathHint plus the stable PONG payload.
+			if !s.applyPathHintPayload(cand, pkt.Payload) {
+				return
+			}
+		} else {
+			// Older servers returned a plain PONG and had no authenticated path
+			// hint. Preserve the historical safe fallback for those peers while
+			// requiring current peers to report Relay/Direct explicitly.
+			cand.mu.Lock()
+			if cand.pathClass == "" && !cand.isPunch {
+				cand.pathClass = candidatePathRelay
+			}
+			cand.mu.Unlock()
 		}
 		cand.mu.Lock()
 		cand.pingReceived++
 		candRTT := cand.rtt
-		path := cand.pathClass
 		punchEndpoint := cand.punchEndpoint
+		isPunch := cand.isPunch
 		cand.mu.Unlock()
 
 		s.router.UpdateMetrics(s.pathForCandidate(cand), candRTT, 0.0)
-		if punchEndpoint != "" && path == candidatePathRelay {
+		if punchEndpoint != "" && !isPunch {
 			s.maybeCreatePunchCandidate(punchEndpoint)
 		}
 		s.selectBestCandidate()
@@ -2313,9 +2379,9 @@ func (s *Client) SetMode(mode string) error {
 				continue
 			}
 			cand.mu.RLock()
-			hint, online, offer := cand.pathClass, cand.online, cand.punchEndpoint
+			isPunch, online, offer := cand.isPunch, cand.online, cand.punchEndpoint
 			cand.mu.RUnlock()
-			if hint == candidatePathRelay && online && offer != "" {
+			if !isPunch && online && offer != "" {
 				if _, exists := seen[offer]; !exists {
 					seen[offer] = struct{}{}
 					offers = append(offers, offer)

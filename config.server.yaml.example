@@ -10,20 +10,30 @@ listen_addr: ":27014"
 # 2. 目标求生之路 2 专用服务器 (Upstream Target)
 target_addr: "127.0.0.1:27015"
 
-# 3. 是否允许自动向本地路由器申请 UPnP 端口映射 (默认关闭；会改变路由器状态)
+# 3. 是否解析 frp/HAProxy 附加的 PROXY Protocol v1/v2 头 (默认关闭)
+# 仅在 UDP 中继确实附加该头时开启；每个来源仅首个 UDP 数据报可携带该头，之后均按普通 L4DP 数据处理。
+proxy_protocol_v2: false
+
+# 4. 允许提供 PROXY 头的中继来源 IP/CIDR，默认仅本机 frp。
+# 该列表只决定是否信任 PROXY 头：来自其它地址的普通无头 L4DP 连接仍可正常接入。
+# 开启 proxy_protocol_v2 时，显式配置为空列表会拒绝启动。
+proxy_protocol_trusted_addrs:
+  - "127.0.0.1"
+
+# 5. 是否允许自动向本地路由器申请 UPnP 端口映射 (默认关闭；会改变路由器状态)
 enable_upnp: false
 
-# 4. 服务端可直连的 IP / 域名列表；可省略端口，自动使用监听端口。
-# 这里只填写服务端自身的公网/LAN 地址。frp 等中继入口应填写在客户端 server_addrs。
+# 6. 声明客户端可以尝试连接服务端的 IP / 域名列表；可省略端口，自动使用监听端口。
+# 这里只声明地址，不决定 Direct/Relay；实际分类由连接是否携带 PROXY 头决定。
 public_ips:
   - "119.29.1.1"
   - "182.92.2.2"
   - "l4d2.example.com"
 
-# 5. 公网 STUN 服务器 (用于打洞: 让 NAT 后的服务端反射出自己的公网端点)
+# 7. 公网 STUN 服务器 (用于打洞: 让 NAT 后的服务端反射出自己的公网端点)
 # 需要可出站访问 UDP 3478。若服务端有端口映射/固定公网端口, 也可用 punch_addr 手动指定。
 stun_server: "stun.cloudflare.com:3478"
 
-# 6. (可选) 手动指定服务端公网打洞端点 (ip:port)。设置后跳过 UPnP 和 STUN 自动发现。
+# 8. (可选) 手动指定服务端公网打洞端点 (ip:port)。设置后跳过 UPnP 和 STUN 自动发现。
 # 为空时自动用 stun_server 反射发现; 设置后跳过 STUN, 直接采用该值 (例如已有端口映射时)。
 punch_addr: ""

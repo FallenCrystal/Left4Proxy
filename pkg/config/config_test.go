@@ -97,15 +97,6 @@ func TestUnknownConfigFieldsRejected(t *testing.T) {
 				return err
 			},
 		},
-		{
-			name:     "removed server field",
-			filename: "server.yaml",
-			contents: "proxy_protocol_v2: false\n",
-			load: func(path string) error {
-				_, err := LoadServerConfig(path)
-				return err
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -136,6 +127,40 @@ func TestEmptyServerConfigUsesDefaults(t *testing.T) {
 	}
 	if cfg.ListenAddr != ":27014" || cfg.TargetAddr != "127.0.0.1:27015" {
 		t.Fatalf("empty config defaults were not preserved: %#v", cfg)
+	}
+	if len(cfg.ProxyTrustedAddrs) != 1 || cfg.ProxyTrustedAddrs[0] != "127.0.0.1" {
+		t.Fatalf("default proxy trusted addrs = %#v, want only 127.0.0.1", cfg.ProxyTrustedAddrs)
+	}
+}
+
+func TestServerConfigLoadsProxyProtocolSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.yaml")
+	data := []byte("proxy_protocol_v2: true\nproxy_protocol_trusted_addrs:\n  - 127.0.0.1\n  - 10.0.0.0/8\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadServerConfig(path)
+	if err != nil {
+		t.Fatalf("load server config: %v", err)
+	}
+	if !cfg.ProxyProtocolV2 {
+		t.Fatal("proxy_protocol_v2=true was not loaded")
+	}
+	want := []string{"127.0.0.1", "10.0.0.0/8"}
+	if strings.Join(cfg.ProxyTrustedAddrs, ",") != strings.Join(want, ",") {
+		t.Fatalf("proxy trusted addrs = %#v, want %#v", cfg.ProxyTrustedAddrs, want)
+	}
+
+	emptyPath := filepath.Join(t.TempDir(), "empty-proxy-whitelist.yaml")
+	if err := os.WriteFile(emptyPath, []byte("proxy_protocol_v2: true\nproxy_protocol_trusted_addrs: []\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	emptyCfg, err := LoadServerConfig(emptyPath)
+	if err != nil {
+		t.Fatalf("load explicit empty proxy whitelist: %v", err)
+	}
+	if emptyCfg.ProxyTrustedAddrs == nil || len(emptyCfg.ProxyTrustedAddrs) != 0 {
+		t.Fatalf("explicit empty proxy whitelist became %#v", emptyCfg.ProxyTrustedAddrs)
 	}
 }
 
