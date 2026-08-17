@@ -2,7 +2,7 @@
 
 listen_addr: :27014
 target_addr: 127.0.0.1:27015
-proxy_protocol_v2: false
-secret: ""
+enable_upnp: false
 public_ips: []
-direct_port_range: "27015"
+stun_server: stun.cloudflare.com:3478
+punch_addr: ""

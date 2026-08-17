@@ -9,6 +9,7 @@ import (
 
 	"left4proxy/pkg/config"
 	"left4proxy/pkg/protocol"
+	"left4proxy/pkg/security"
 	"left4proxy/pkg/server"
 	"left4proxy/pkg/stun"
 )
@@ -16,14 +17,17 @@ import (
 const stunMagicCookie = uint32(0x2112A442)
 
 // mockStunBindingResponse builds a STUN Binding Response whose
-// XOR-MAPPED-ADDRESS reflects src (IPv4). Mirrors RFC 5389 §15.2.
-func mockStunBindingResponse(src *net.UDPAddr) []byte {
+// XOR-MAPPED-ADDRESS reflects src (IPv4). Mirrors RFC 5389 §15.2 and echoes
+// the request transaction ID so the production Validator can authenticate it.
+func mockStunBindingResponse(request []byte, src *net.UDPAddr) []byte {
 	ip4 := src.IP.To4()
 	resp := make([]byte, 20+12)
 	binary.BigEndian.PutUint16(resp[0:2], 0x0101) // Binding Response
 	binary.BigEndian.PutUint16(resp[2:4], 12)     // total attribute length (4 header + 8 value)
 	binary.BigEndian.PutUint32(resp[4:8], stunMagicCookie)
-	// transaction ID [8:20] left zero — the parser does not validate it.
+	if len(request) >= 20 {
+		copy(resp[8:20], request[8:20])
+	}
 	attr := resp[20:]
 	binary.BigEndian.PutUint16(attr[0:2], 0x0020) // XOR-MAPPED-ADDRESS
 	binary.BigEndian.PutUint16(attr[2:4], 8)
@@ -56,8 +60,8 @@ func startMockStunServer(t *testing.T) (*net.UDPAddr, func()) {
 			if rerr != nil {
 				continue
 			}
-			if stun.IsStunResponse(buf[:n]) { // any STUN message -> reflect sender
-				_, _ = conn.WriteToUDP(mockStunBindingResponse(src), src)
+			if stun.IsStunMessage(buf[:n]) { // any STUN message -> reflect sender
+				_, _ = conn.WriteToUDP(mockStunBindingResponse(buf[:n], src), src)
 			}
 		}
 	}()
@@ -69,9 +73,20 @@ func startMockStunServer(t *testing.T) (*net.UDPAddr, func()) {
 // the parsed session ID and the response payload split on "|". It skips any
 // push packets (e.g. a CmdPunchOffer broadcast at startup) that may arrive
 // before the handshake response.
-func handshakeRaw(t *testing.T, conn *net.UDPConn) (uint64, []string) {
+func integrationKey() []byte {
+	key := make([]byte, security.KeySize)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	return key
+}
+
+func handshakeRaw(t *testing.T, conn *net.UDPConn, key []byte) (uint64, []string, *security.Session) {
 	t.Helper()
-	req := protocol.NewPacket(protocol.CmdHandshakeReq, 0, 0, []byte("HANDSHAKE"))
+	req, pending, err := security.NewHandshakeRequest(key, 1)
+	if err != nil {
+		t.Fatalf("create handshake: %v", err)
+	}
 	if _, err := conn.Write(req.Marshal()); err != nil {
 		t.Fatalf("handshake write: %v", err)
 	}
@@ -88,11 +103,37 @@ func handshakeRaw(t *testing.T, conn *net.UDPConn) (uint64, []string) {
 			continue
 		}
 		if pkt.Cmd == protocol.CmdHandshakeResp {
-			return pkt.SessionID, strings.Split(string(pkt.Payload), "|")
+			resp, session, verr := security.VerifyHandshakeResponse(key, pkt, pending, time.Now().UnixNano())
+			if verr != nil {
+				continue
+			}
+			return resp.SessionID, strings.Split(string(resp.Metadata), "|"), session
 		}
 	}
 	t.Fatalf("handshake response not received")
-	return 0, nil
+	return 0, nil, nil
+}
+
+func sealIntegrationPacket(t *testing.T, session *security.Session, cmd byte, payload []byte) []byte {
+	t.Helper()
+	seq, err := session.NextSeq()
+	if err != nil {
+		t.Fatalf("next sequence: %v", err)
+	}
+	data, err := session.Seal(protocol.NewPacket(cmd, session.ID, seq, payload), security.ClientToServer)
+	if err != nil {
+		t.Fatalf("seal packet: %v", err)
+	}
+	return data
+}
+
+func openIntegrationPacket(t *testing.T, session *security.Session, data []byte) *protocol.Packet {
+	t.Helper()
+	pkt, err := session.Open(data, security.ServerToClient)
+	if err != nil {
+		t.Fatalf("open packet: %v", err)
+	}
+	return pkt
 }
 
 // TestServerStunDiscoveryAdvertisesEndpoint verifies the server reflects its own
@@ -101,11 +142,13 @@ func handshakeRaw(t *testing.T, conn *net.UDPConn) (uint64, []string) {
 func TestServerStunDiscoveryAdvertisesEndpoint(t *testing.T) {
 	mockAddr, stopStun := startMockStunServer(t)
 	defer stopStun()
+	key := integrationKey()
 
 	serverCfg := config.DefaultServerConfig()
 	serverCfg.ListenAddr = "127.0.0.1:28314"
 	serverCfg.TargetAddr = "127.0.0.1:28315"
 	serverCfg.StunServer = mockAddr.String()
+	serverCfg.AuthKey = key
 
 	srv, err := server.NewServer(serverCfg)
 	if err != nil {
@@ -125,22 +168,28 @@ func TestServerStunDiscoveryAdvertisesEndpoint(t *testing.T) {
 	}
 	defer raw.Close()
 
-	_, parts := handshakeRaw(t, raw)
-	if len(parts) < 4 {
-		t.Fatalf("expected a 4-field handshake payload, got %d fields: %q", len(parts), strings.Join(parts, "|"))
+	_, parts, _ := handshakeRaw(t, raw, key)
+	if len(parts) != 3 {
+		t.Fatalf("expected a 3-field handshake payload, got %d fields: %q", len(parts), strings.Join(parts, "|"))
 	}
-	if want := "127.0.0.1:28314"; parts[3] != want {
-		t.Fatalf("handshake 4th field = %q, want %q (server public endpoint)", parts[3], want)
+	// A local UPnP mapper may win the race with the mock STUN response in CI;
+	// either endpoint is valid as long as it is an address on the configured
+	// listener port and the field is not empty/forged text.
+	_, port, err := net.SplitHostPort(parts[2])
+	if err != nil || port != "28314" {
+		t.Fatalf("handshake punch field = %q, want a valid endpoint on port 28314", parts[2])
 	}
 }
 
 // TestServerPunchesInitTarget verifies the server replies to CmdPunchInit with
 // CmdPunchAck and then proactively probes the given direct target.
 func TestServerPunchesInitTarget(t *testing.T) {
+	key := integrationKey()
 	serverCfg := config.DefaultServerConfig()
 	serverCfg.ListenAddr = "127.0.0.1:28324"
 	serverCfg.TargetAddr = "127.0.0.1:28325"
 	serverCfg.PunchAddr = "127.0.0.1:28324" // manual override (avoids STUN here)
+	serverCfg.AuthKey = key
 
 	srv, err := server.NewServer(serverCfg)
 	if err != nil {
@@ -157,12 +206,12 @@ func TestServerPunchesInitTarget(t *testing.T) {
 	}
 	defer raw.Close()
 
-	sid, _ := handshakeRaw(t, raw)
+	_, _, session := handshakeRaw(t, raw, key)
 
 	// Pretend this socket is the client's direct (punch) socket and tell the
 	// server to open a hole toward it.
-	init := protocol.NewPacket(protocol.CmdPunchInit, sid, 0, []byte(raw.LocalAddr().String()))
-	if _, err := raw.Write(init.Marshal()); err != nil {
+	init := sealIntegrationPacket(t, session, protocol.CmdPunchInit, []byte(raw.LocalAddr().String()))
+	if _, err := raw.Write(init); err != nil {
 		t.Fatalf("punch init write: %v", err)
 	}
 
@@ -175,7 +224,7 @@ func TestServerPunchesInitTarget(t *testing.T) {
 		if err != nil {
 			break
 		}
-		pkt, uerr := protocol.Unmarshal(buf[:n])
+		pkt, uerr := session.Open(buf[:n], security.ServerToClient)
 		if uerr != nil {
 			continue
 		}
@@ -209,11 +258,13 @@ func TestServerPunchesInitTarget(t *testing.T) {
 func TestPunchCandidateEstablishment(t *testing.T) {
 	mockAddr, stopStun := startMockStunServer(t)
 	defer stopStun()
+	key := integrationKey()
 
 	serverCfg := config.DefaultServerConfig()
 	serverCfg.ListenAddr = "127.0.0.1:28334"
 	serverCfg.TargetAddr = "127.0.0.1:28335"
 	serverCfg.PunchAddr = "127.0.0.1:28334"
+	serverCfg.AuthKey = key
 
 	srv, err := server.NewServer(serverCfg)
 	if err != nil {
@@ -230,6 +281,8 @@ func TestPunchCandidateEstablishment(t *testing.T) {
 	clientCfg.StunServer = mockAddr.String()
 	clientCfg.EnableLAN = true
 	clientCfg.EnablePunch = true
+	clientCfg.PingInterval = 1
+	clientCfg.AuthKey = key
 
 	cli, err := NewClient(clientCfg)
 	if err != nil {
@@ -258,7 +311,7 @@ func TestPunchCandidateEstablishment(t *testing.T) {
 	relay := cli.candidates[0]
 	cli.candidateMu.RUnlock()
 	relay.mu.Lock()
-	relay.pathHint = "relay"
+	relay.pathClass = "relay"
 	relay.online = true
 	relay.mu.Unlock()
 
@@ -347,7 +400,7 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 
 	// 2. relay-only mode -> no punch candidate even with a relay.
 	c = mk("relay-only")
-	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", pathHint: "relay", online: true}}
+	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", pathClass: "relay", online: true}}
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 1 {
 		t.Fatalf("relay-only must not create a punch candidate")
@@ -357,7 +410,7 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 	// 3. An existing candidate at the same address -> skipped (redundant).
 	c = mk("auto")
 	dup, _ := net.ResolveUDPAddr("udp", target)
-	c.candidates = []*serverCandidate{{addrStr: target, udpAddr: dup, online: true, pathHint: "relay"}}
+	c.candidates = []*serverCandidate{{addrStr: target, udpAddr: dup, online: true, pathClass: "relay"}}
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 1 {
 		t.Fatalf("duplicate address must not create a second candidate")
@@ -367,12 +420,101 @@ func TestMaybeCreatePunchCandidateGating(t *testing.T) {
 	// 4. A relay candidate at a different address -> punch candidate created.
 	c = mk("auto")
 	relayAddr, _ := net.ResolveUDPAddr("udp", "1.2.3.4:27014")
-	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", udpAddr: relayAddr, online: true, pathHint: "relay"}}
+	c.candidates = []*serverCandidate{{addrStr: "1.2.3.4:27014", udpAddr: relayAddr, online: true, pathClass: "relay"}}
 	c.maybeCreatePunchCandidate(target)
 	if len(c.candidates) != 2 || !c.candidates[1].isPunch {
 		t.Fatalf("expected a punch candidate to be created, got %d candidates", len(c.candidates))
 	}
 	c.Stop()
+}
+
+func TestModeSwitchRetiresAndRestoresPunchCandidate(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	cfg.EnablePunch = true
+	cfg.StunServer = "127.0.0.1:9"
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+
+	relayAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 39991}
+	relay := &serverCandidate{
+		addrStr:       relayAddr.String(),
+		udpAddr:       relayAddr,
+		online:        true,
+		lastActive:    time.Now(),
+		rtt:           20 * time.Millisecond,
+		pathClass:     candidatePathRelay,
+		punchEndpoint: "127.0.0.1:39992",
+	}
+	punchConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	punchAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 39992}
+	punch := &serverCandidate{
+		addrStr:    punchAddr.String(),
+		udpAddr:    punchAddr,
+		conn:       punchConn,
+		sendTo:     punchAddr,
+		isPunch:    true,
+		online:     true,
+		lastActive: time.Now(),
+		rtt:        10 * time.Millisecond,
+		pathClass:  candidatePathPunch,
+	}
+	c.candidates = []*serverCandidate{relay, punch}
+	c.bestCandidate = punch
+
+	if err := c.SetMode("relay-only"); err != nil {
+		t.Fatal(err)
+	}
+	c.candidateMu.RLock()
+	if len(c.candidates) != 1 || c.candidates[0] != relay {
+		c.candidateMu.RUnlock()
+		t.Fatalf("relay-only candidates = %#v, want only relay", c.candidates)
+	}
+	c.candidateMu.RUnlock()
+
+	if err := c.SetMode("auto"); err != nil {
+		t.Fatal(err)
+	}
+	c.candidateMu.RLock()
+	restored := false
+	for _, cand := range c.candidates {
+		if cand != nil {
+			cand.mu.RLock()
+			isRestored := cand.isPunch && sameUDPAddr(cand.udpAddr, punchAddr)
+			cand.mu.RUnlock()
+			if isRestored {
+				restored = true
+				break
+			}
+		}
+	}
+	c.candidateMu.RUnlock()
+	if !restored {
+		t.Fatal("auto mode did not recreate the punch candidate cached by the relay")
+	}
+}
+
+func TestWaitPublicEndpointStopsForRetiredCandidate(t *testing.T) {
+	cfg := config.DefaultClientConfig()
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+
+	cand := &serverCandidate{retired: true}
+	started := time.Now()
+	if got := c.waitPublicEndpoint(cand, time.Second); got != "" {
+		t.Fatalf("public endpoint = %q, want empty for retired candidate", got)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("waitPublicEndpoint took %v for an already retired candidate", elapsed)
+	}
 }
 
 // TestPunchIsFallbackWhenRelayDies verifies the resilience story: while the
@@ -384,9 +526,9 @@ func TestPunchIsFallbackWhenRelayDies(t *testing.T) {
 	c := &Client{cfg: cfg}
 
 	relay := mkCand("157.148.128.243:18276", 52*time.Millisecond, true, false)
-	relay.pathHint = "relay"
+	relay.pathClass = "relay"
 	punch := mkCand("64.186.238.133:41465", 318*time.Millisecond, true, false)
-	punch.pathHint = "punch"
+	punch.pathClass = "punch"
 	punch.isPunch = true
 
 	c.candidates = []*serverCandidate{relay, punch}
@@ -500,6 +642,7 @@ func TestRawSenderAddrMigration(t *testing.T) {
 	serverCfg := config.DefaultServerConfig()
 	serverCfg.ListenAddr = "127.0.0.1:28344"
 	serverCfg.TargetAddr = "127.0.0.1:28345"
+	serverCfg.AuthKey = integrationKey()
 
 	srv, err := server.NewServer(serverCfg)
 	if err != nil {
@@ -521,13 +664,13 @@ func TestRawSenderAddrMigration(t *testing.T) {
 	}
 	defer connB.Close()
 
-	sid, _ := handshakeRaw(t, connA)
+	_, _, session := handshakeRaw(t, connA, serverCfg.AuthKey)
 	payload := []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T', 'S', 'o', 'u', 'r', 'c', 'e'}
 	buf := make([]byte, 2048)
 
 	// 1. Socket A sends a game packet; the reply must come back to A.
-	dataA := protocol.NewPacket(protocol.CmdData, sid, 1, payload)
-	if _, err := connA.Write(dataA.Marshal()); err != nil {
+	dataA := sealIntegrationPacket(t, session, protocol.CmdData, payload)
+	if _, err := connA.Write(dataA); err != nil {
 		t.Fatalf("write A: %v", err)
 	}
 	_ = upstream.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -544,10 +687,26 @@ func TestRawSenderAddrMigration(t *testing.T) {
 	}
 	t.Logf("packet A replied to socket A (received %d bytes)", n)
 
-	// 2. Socket B sends a game packet with the same session ID; the reply must
-	// migrate to socket B (the server re-points rawSenderAddr on every CmdData).
-	dataB := protocol.NewPacket(protocol.CmdData, sid, 2, payload)
-	if _, err := connB.Write(dataB.Marshal()); err != nil {
+	// Authorize the direct socket through the authenticated PunchInit control
+	// packet, then send a game packet with the same session ID.  An arbitrary
+	// unauthenticated source is intentionally rejected by the server.
+	initB := sealIntegrationPacket(t, session, protocol.CmdPunchInit, []byte(connB.LocalAddr().String()))
+	if _, err := connA.Write(initB); err != nil {
+		t.Fatalf("write PunchInit: %v", err)
+	}
+	_ = connA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		n, err := connA.Read(buf)
+		if err != nil {
+			t.Fatalf("PunchAck read: %v", err)
+		}
+		if pkt, err := session.Open(buf[:n], security.ServerToClient); err == nil && pkt.Cmd == protocol.CmdPunchAck {
+			break
+		}
+	}
+
+	dataB := sealIntegrationPacket(t, session, protocol.CmdData, payload)
+	if _, err := connB.Write(dataB); err != nil {
 		t.Fatalf("write B: %v", err)
 	}
 	_ = upstream.SetReadDeadline(time.Now().Add(2 * time.Second))

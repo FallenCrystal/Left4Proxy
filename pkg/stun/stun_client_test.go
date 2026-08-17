@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+	"time"
 )
 
 // buildResponse assembles a STUN Binding Response with an XOR-MAPPED-ADDRESS
@@ -60,8 +61,91 @@ func TestBuildBindingRequest(t *testing.T) {
 	if binary.BigEndian.Uint32(req[4:8]) != stunMagicCookie {
 		t.Fatalf("bad magic cookie")
 	}
-	if !IsStunResponse(req) {
+	if !IsStunMessage(req) {
 		t.Fatalf("request should look like a STUN message")
+	}
+	if IsStunResponse(req) {
+		t.Fatalf("request must not be classified as a response")
+	}
+}
+
+func TestValidatorRejectsForgedResponses(t *testing.T) {
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConn.Close()
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	serverAddr := serverConn.LocalAddr().(*net.UDPAddr)
+	validator := NewValidator()
+	if err := validator.SendBindingRequest(clientConn, serverAddr); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2048)
+	_ = serverConn.SetReadDeadline(time.Now().Add(time.Second))
+	_, src, err := serverConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := buildResponse(net.IPv4(203, 0, 113, 7), 42123)
+	copy(valid[8:20], buf[8:20])
+	// A wrong transaction ID must not be accepted.
+	for i := 8; i < 20; i++ {
+		valid[i] = 0
+	}
+	if _, err := validator.Accept(valid, src); err == nil {
+		t.Fatal("response with wrong transaction ID accepted")
+	}
+	copy(valid[8:20], buf[8:20])
+	// A valid response from a different source is still rejected.
+	wrongPort := serverAddr.Port + 1
+	if wrongPort > 65535 {
+		wrongPort = serverAddr.Port - 1
+	}
+	wrongSource := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wrongPort}
+	if _, err := validator.Accept(valid, wrongSource); err == nil {
+		t.Fatal("response from wrong source accepted")
+	}
+	if _, err := validator.Accept(valid, serverAddr); err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+	if _, err := validator.Accept(valid, serverAddr); err == nil {
+		t.Fatal("consumed transaction accepted twice")
+	}
+}
+
+func TestValidatorRejectsExpiredTransaction(t *testing.T) {
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConn.Close()
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	validator := NewValidator()
+	validator.ttl = 10 * time.Millisecond
+	serverAddr := serverConn.LocalAddr().(*net.UDPAddr)
+	if err := validator.SendBindingRequest(clientConn, serverAddr); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2048)
+	_ = serverConn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = serverConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := buildResponse(net.IPv4(203, 0, 113, 8), 40000)
+	copy(resp[8:20], buf[8:20])
+	time.Sleep(20 * time.Millisecond)
+	if _, err := validator.Accept(resp, serverAddr); err == nil {
+		t.Fatal("expired transaction accepted")
 	}
 }
 
@@ -98,5 +182,26 @@ func TestParseBindingResponseJunk(t *testing.T) {
 	// A valid-looking request (not a response) must be rejected.
 	if _, err := ParseBindingResponse(BuildBindingRequest()); err == nil {
 		t.Fatalf("expected error for a request, not a response")
+	}
+}
+
+func TestParseBindingResponseRejectsMalformedTrailingAttributes(t *testing.T) {
+	resp := buildResponse(net.IPv4(203, 0, 113, 9), 40001)
+	// Append an attribute whose declared value is truncated. The mapped address
+	// is valid, but the complete message must still be rejected structurally.
+	resp = append(resp, 0x00, 0x01, 0x00, 0x02, 0xFF)
+	binary.BigEndian.PutUint16(resp[2:4], uint16(len(resp)-stunHeaderLen))
+	if _, err := ParseBindingResponse(resp); err == nil {
+		t.Fatal("response with malformed trailing attribute was accepted")
+	}
+
+	// Duplicate mapped-address attributes are ambiguous and should not be
+	// accepted as if the first one were authoritative.
+	valid := buildResponse(net.IPv4(203, 0, 113, 10), 40002)
+	duplicate := buildResponse(net.IPv4(203, 0, 113, 11), 40003)[stunHeaderLen:]
+	valid = append(valid, duplicate...)
+	binary.BigEndian.PutUint16(valid[2:4], uint16(len(valid)-stunHeaderLen))
+	if _, err := ParseBindingResponse(valid); err == nil {
+		t.Fatal("response with duplicate mapped-address attributes was accepted")
 	}
 }

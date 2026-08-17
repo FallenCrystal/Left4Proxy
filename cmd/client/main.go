@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -10,11 +11,14 @@ import (
 
 	"left4proxy/pkg/client"
 	"left4proxy/pkg/config"
+	"left4proxy/pkg/termui"
 )
 
 const Version = "1.0.0"
 
 func main() {
+	log.SetOutput(termui.NewColorLogWriter(os.Stderr))
+
 	var (
 		configFile  string
 		serverAddr  string
@@ -76,10 +80,23 @@ func main() {
 		log.Fatalf("Failed to start client: %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	<-sigCh
-	log.Println("[Client] Shutting down...")
+	cliHandler := client.NewCLI(cli, os.Stdin, os.Stdout, cancel, Version)
+	go cliHandler.Run(ctx)
+
+	log.Printf("[Client] Ready. Type 'status' for connection info, 'help' for commands, 'quit' to exit.")
+
+	select {
+	case <-sigCh:
+		log.Println("[Client] Shutting down (signal received)...")
+	case <-ctx.Done():
+		log.Println("[Client] Shutting down (CLI quit)...")
+	}
+
 	cli.Stop()
 }

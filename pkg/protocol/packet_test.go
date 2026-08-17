@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -59,5 +60,50 @@ func TestUnmarshalInvalidMagic(t *testing.T) {
 	_, err := Unmarshal(badData)
 	if err != ErrInvalidMagic {
 		t.Errorf("expected ErrInvalidMagic, got %v", err)
+	}
+}
+
+func TestExportedMagicCannotChangeWireProtocol(t *testing.T) {
+	original := Magic
+	Magic = [4]byte{'B', 'A', 'D', '!'}
+	t.Cleanup(func() { Magic = original })
+	pkt := NewPacket(CmdPing, 1, 1, nil)
+	wire := pkt.Marshal()
+	if string(wire[:4]) != "L4DP" {
+		t.Fatalf("wire magic changed through exported compatibility value: %q", wire[:4])
+	}
+	if _, err := Unmarshal(wire); err != nil {
+		t.Fatalf("canonical packet rejected after Magic mutation: %v", err)
+	}
+}
+
+func TestUnmarshalRejectsLegacyAndTrailingBytes(t *testing.T) {
+	pkt := NewPacket(CmdPing, 1, 1, []byte("x"))
+	wire := pkt.Marshal()
+	wire[4] = Version1
+	if _, err := Unmarshal(wire); err != ErrInvalidVersion {
+		t.Fatalf("legacy version error = %v", err)
+	}
+	wire = pkt.Marshal()
+	wire = append(wire, 0)
+	if _, err := Unmarshal(wire); err == nil {
+		t.Fatal("packet with trailing bytes was accepted")
+	}
+}
+
+func TestUnmarshalRejectsDatagramsThatExceedUDPSize(t *testing.T) {
+	pkt := NewPacket(CmdData, 1, 1, make([]byte, MaxPacketPayloadSize+1))
+	wire := pkt.Marshal()
+	if _, err := Unmarshal(wire); err == nil || !errors.Is(err, ErrPacketTooLarge) {
+		t.Fatalf("oversized packet error = %v, want ErrPacketTooLarge", err)
+	}
+
+	tooLargeGamePayload := make([]byte, MaxUDPPayloadSize+1)
+	tooLargeGamePayload[0] = 0xff
+	tooLargeGamePayload[1] = 0xff
+	tooLargeGamePayload[2] = 0xff
+	tooLargeGamePayload[3] = 0xff
+	if IsL4D2Packet(tooLargeGamePayload) {
+		t.Fatal("oversized UDP payload was classified as an L4D2 packet")
 	}
 }
