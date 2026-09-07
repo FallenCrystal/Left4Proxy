@@ -47,18 +47,17 @@ Left4Proxy 不会因为打了洞就优先选打洞, 而是依旧选择延迟最�
 ## 部署操作
 
 1. 部署一个 L4D2 专用服务器. 端口保持 `27015`, ip 开放 `0.0.0.0`.
-2. (可选) 部署内网穿透.  
-   本地端口应使用 Left4Proxy 服务端的 `listen_addr` 端口 (默认 `27014`), 而不是《求生之路》游戏的 27015;  
-   转发 `127.0.0.1:27014`, frpc配置侧指定 `proxy_protocol_version = v2`. 在 Left4Proxy 服务端的配置中启用 `proxy_protocol_v2`;  
+2. (可选, 独立服务器可跳过) 部署内网穿透.  
+   本地端口应使用 Left4Proxy 服务端的 `listen_addr` 端口 (默认 `27014`, 不是求生之路的27015);  
+   转发 UDP `127.0.0.1:27014`, frpc配置侧指定 `proxy_protocol_version = v2`. 在 Left4Proxy 服务端的配置中启用 `proxy_protocol_v2`;  
    如果服务端可以接受非 `127.0.0.1` 的其它代理头, 请将对应的 IP/CIDR 添加到配置的 `proxy_protocol_trusted_addrs` 内
-4. 部署并首次启动 Left4Proxy Server. 它会在服务端运行时目录创建 `.secret` 文件. 如果没有该文件, 客户端将无法验证. 
+4. 部署并首次启动 Left4Proxy 服务器. 它会在服务端运行时目录创建 `.secret` 文件. 如果没有该文件, 客户端将无法验证. 
 5. 把服务端生成的同一个 `.secret` 放到到每台客户端的运行时目录下. (对于其它要联机的普通玩家, 提前打包好密钥)
 6. 在服务端 `public_ips` 内添加声明可以连接到 Left4Proxy 服务端的地址:
    - 如果你的电脑和服务器和内网处于同一局域网. 添加内网 IP `192.168.x.x:27014` 用于直接连接.  
    - 如果服务器有公网直连地址, 直接添加其公网 IP/域名:端口 即可.
-   - 这里是地址公告，不是路径分类；即使某地址也经过 frp，最终仍按该连接是否带 PROXY 头分类。
-7. 客户端打开 Left4Proxy Client, 在 `server_addrs` 中填写一个或多个可连接到 Left4Proxy 服务端的地址. 验证是否可连接
-   如果服务器侧还配置了内网 IP 且你和服务器在同一内网, 它应该会自动切换到内网 IP.
+   - 在这里添加其它线路而不需要动客户端配置
+7. 客户端打开 Left4Proxy 客户端, 在 `server_addrs` 中填写任意一个可以连接到 Left4Proxy 服务器的地址.  
 8. 启动 Left4Proxy 的服务器和客户端, 求生之路专用服务器和求生之路客户端. 客户端控制台输入 `connect 127.0.0.2` 测试正常连接.
 
 ## 救救朋友的答辩网络
@@ -120,7 +119,7 @@ Left4Proxy 不会因为打了洞就优先选打洞, 而是依旧选择延迟最�
 
 不是Left4Proxy的锅.
 
-服务器配置 `sv_lan 1` 即可.
+求生之路服务器配置 `sv_lan 1` 即可.
 
 不会影响 `mm_dedicated_force_servers` 匹配到您的服务器的行为, 也不会影响 `connect` 命令连接的行为.
 
@@ -129,6 +128,13 @@ Left4Proxy 不会因为打了洞就优先选打洞, 而是依旧选择延迟最�
 Failed to start client: failed to listen on local UDP x.x.x.x:27015: bind: An attempt was made to access a socket in a way forbidden by its access permissions.
 
 请先回到主界面或退出游戏 (求生之路). 如果还不行, 尝试关闭防火墙或杀毒软件.
+
+### 内网穿透线路被标记为 `Direct` 而不是 `Relay`
+
+请正确配置 frpc 的 `proxy_protocol_version` 为v2, 确保 Left4Proxy 服务器侧配置已启用 `proxy_protocol_v2`.
+
+确保 `proxy_protocol_trusted_addrs` 中已包含内网穿透连接到 Left4Proxy 服务器的地址 (默认 127.0.0.1, 其它地址请自行添加);  
+如果还不行, 检查控制台中是否有 `Dropped PROXY header from <ip> because ...` 相关警告.
 
 ## 配置文件说明
 
@@ -155,9 +161,9 @@ punch_addr: ""
 ```
 
 - `listen_addr`: 服务端 UDP 监听地址.
-- `target_addr`: 实际 L4D2 服务器监听地址. (避免 Loopback 通常为LAN IP)
-- `proxy_protocol_v2`: 是否解析可信 UDP 中继首个数据报附加的 PROXY Protocol v2 头. 每个连接只有首个 UDP 数据报会被解析, 之后所有包都视为普通数据包. 默认为 `false`
-- `proxy_protocol_trusted_addrs`: 可提供 PROXY 头的中继来源 IP/CIDR 白名单，默认仅 `127.0.0.1`. 它不要求名单内来源一定携带头，也不会拒绝名单外的普通 L4DP 连接。启用 `proxy_protocol_v2` 时不可显式设为空列表. 名单外来源附加头会记录 `Dropped PROXY header from <ip> because this address is not in proxy_protocol_trusted_addrs`。
+- `target_addr`: 实际 L4D2 服务器监听地址. (避免 Loopback 通常为LAN IP或除`127.0.0.1`以外的本地 IP)
+- `proxy_protocol_v2`: 是否解析可信 UDP 中继首个数据报附加的 Proxy Protocol v2 头. 每个连接只有首个 UDP 数据报会被解析, 之后所有包都视为普通数据包. 默认为 `false`
+- `proxy_protocol_trusted_addrs`: 可提供代理头的中继来源 IP/CIDR 白名单. 默认仅 `127.0.0.1`. 启用代理头解析时不可显式设置为空. 非信任 IP 传入的代理头会被丢弃并在控制台打印一次警告.
 - `enable_upnp`: 是否允许服务端自动申请并在退出时释放 UPnP UDP 端口映射. 默认关闭; 若配置了 `punch_addr`, 即使开启也不会触碰 UPnP. 
 - `public_ips`: 服务端认证后广播给客户端的可连接地址列表 (可以包含服务端局域网、公网地址或需要尝试的入口). 它只声明地址，不决定 Direct/Relay；实际分类由该候选的认证 Ping/Pong 是否经过 PROXY 头决定。条目可以写成裸 IP/域名, 服务端会自动补实际监听端口; 带端口时必须是合法的 `host:port`.
 - `stun_server`: 打洞用的公网 STUN 服务器 (默认 `stun.cloudflare.com:3478`, 需可出站访问 UDP 3478). 服务端用它反射出自己的公网端点并广播给客户端.
@@ -178,13 +184,13 @@ ping_interval: 3
 stun_server: "stun.cloudflare.com:3478"
 ```
 
-- `server_addrs`: 客户端启动时首先尝试的服务端地址列表，例如 frp UDP 隧道、服务端公网地址或局域网地址。它只声明地址，不决定 Direct/Relay；实际分类由该候选的认证 Ping/Pong 是否经过 PROXY 头决定。
+- `server_addrs`: 客户端启动时首先尝试的服务端地址列表. 例如 frp UDP 隧道、服务端公网地址或局域网地址.
 - `listen_addr`: 本地监听地址 (默认 `127.0.0.2:27015`, Source 引擎拒绝连接 `127.0.0.1`, 故使用其它环回地址) . 
-- `mode`: 路由模式, 支持 `auto` (自动择优) , `direct-only` (只走认证后标记为 Direct/LAN 或 Punch 的候选) , `relay-only` (只走认证后标记为 Relay 的候选) . 候选来自 `server_addrs` 或 `public_ips` 不影响该判定；指定类型没有可用候选时会停止转发, 不会跨类型临时回退.
+- `mode`: 路由模式, 支持 `auto` (自动择优) , `direct-only` (只走认证后标记为 Direct/LAN 或 Punch 的候选) , `relay-only` (只走认证后标记为 Relay 的候选).  
 - `enable_lan`: 是否启用局域网直连检测 (同局域网时优先走 LAN, 免绕公网) . 
 - `enable_punch`: 是否启用 STUN 打洞直连 (服务端在 NAT 后时, 为玩家打洞直连绕过 frp 中继; 打洞失败自动回落中继) . 
 - `ping_interval`: 心跳探测间隔 (秒) . 
-- `stun_server`: 打洞套接字反射公网端点所用的 STUN 服务器 (默认 `stun.cloudflare.com:3478`) . 
+- `stun_server`: 打洞套接字反射公网端点所用的 STUN 服务器 (默认 `stun.cloudflare.com:3478`).
 
 ## 构建与运行
 
